@@ -1,0 +1,431 @@
+import json
+import math
+import re
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta
+from pathlib import Path
+from typing import Any
+
+from travian_kingdoms_api import (
+    TravelGuess,
+    Village,
+    build_travel_guess,
+    get_main_village_of_player,
+    get_most_similar_player_name,
+    get_most_similar_village_of_player,
+    guess_tp_levels,
+    list_player_villages,
+    players_data,
+    village_distance,
+)
+
+
+ATTACK_PATTERN = re.compile(
+    r"(?is)"
+    r"(?:\b(?:angriff|attack|belagerung|siege)\b[\s:,-]*)?"
+    r"(?:von|by)\s+"
+    r"(?P<attacker>.+?)\s+"
+    r"(?:aus|from)\s+"
+    r"(?P<attacking_village>.+?)\s*"
+    r"in\s*(?P<travel_time>\d{1,2}:\d{2}:\d{2})\s+"
+    r"(?:um|at)\s+(?P<arrival_time>\d{1,2}:\d{2}:\d{2})"
+)
+
+@dataclass(frozen=True)
+class ParsedAttackMessage:
+    raw_text: str
+    defender_name_hint: str | None
+    defender_village_hint: str | None
+    use_message_author_for_defender: bool
+    attacker_hint: str
+    attacking_village_hint: str
+    travel_time_text: str
+    arrival_time_text: str
+    is_siege: bool
+
+
+@dataclass(frozen=True)
+class PlayerMatch:
+    name: str
+    player_id: str
+
+
+@dataclass(frozen=True)
+class AttackResolution:
+    parsed: ParsedAttackMessage
+    noted_time: datetime
+    arrival_time: datetime
+    attacker: PlayerMatch
+    defender: PlayerMatch
+    attacker_village: Village
+    defender_village: Village
+    distance: float
+    guesses: dict[str, TravelGuess | None]
+    defender_used_main_village: bool
+
+
+TRANSLATIONS = {
+    "de": {
+        "attack_normal": "Angriff erkannt",
+        "attack_siege": "Belagerung erkannt",
+        "from_to": "Von [{attacker}]({attacker_link}) / [{attacker_village}]({attacker_village_link}) nach [{defender}]({defender_link}) / [{defender_village}]({defender_village_link})",
+        "noted_time": "Meldezeit",
+        "arrival_time": "Ankunft",
+        "remaining_time": "Restlaufzeit",
+        "message_link": "Nachrichtenlink",
+        "distance": "Distanz",
+        "fields": "Felder",
+        "tp_irrelevant": "TP egal",
+        "speed": "Geschwindigkeit",
+        "ram": "Rammen",
+        "katapult": "Katapulte",
+        "tp_below_20": "Geschwindigkeit `{speed}`, Start `{start_time}`",
+        "tp_value": "TP `{tp_level}`, Start `{start_time}`",
+        "tp_previous": "Mit TP `{tp_level}` haette schon um `{start_time}` gestartet werden muessen",
+        "no_valid_guess": "Keine gueltige Schaetzung",
+    }
+}
+
+
+def load_map_payload(path: str = "travian-map-data.json") -> dict[str, Any]:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def parse_attack_message(content: str) -> ParsedAttackMessage | None:
+    compact = content.strip()
+    if not compact:
+        return None
+
+    defender_name_hint: str | None = None
+    defender_village_hint: str | None = None
+    use_message_author_for_defender = False
+    override = _extract_defender_override(compact)
+    if override is not None:
+        defender_name_hint, defender_village_hint, compact, use_message_author_for_defender = override
+
+    prefix_match = re.match(r"(?s)^\s*([^:\n]{1,80})\s*:\s*(.+)$", compact)
+    if prefix_match:
+        possible_hint = prefix_match.group(1).strip()
+        remaining = prefix_match.group(2).strip()
+        if ATTACK_PATTERN.search(remaining):
+            defender_village_hint = possible_hint
+            compact = remaining
+    else:
+        lines = [line.strip() for line in compact.splitlines() if line.strip()]
+        if len(lines) >= 2 and ATTACK_PATTERN.search(lines[0]) is None and ATTACK_PATTERN.search(lines[1]):
+            defender_village_hint = lines[0]
+            compact = "\n".join(lines[1:])
+
+    match = ATTACK_PATTERN.search(compact)
+    if not match:
+        return None
+
+    lowered = compact.casefold()
+    return ParsedAttackMessage(
+        raw_text=content,
+        defender_name_hint=defender_name_hint,
+        defender_village_hint=defender_village_hint,
+        use_message_author_for_defender=use_message_author_for_defender,
+        attacker_hint=_clean_segment(match.group("attacker")),
+        attacking_village_hint=_clean_segment(match.group("attacking_village")),
+        travel_time_text=match.group("travel_time"),
+        arrival_time_text=match.group("arrival_time"),
+        is_siege=("belagerung" in lowered) or ("siege" in lowered),
+    )
+
+
+def split_attack_messages(content: str) -> list[str]:
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    attack_indices = [index for index, line in enumerate(lines) if ATTACK_PATTERN.search(line)]
+    if len(attack_indices) <= 1:
+        return [content]
+
+    shared_prefix = "\n".join(lines[:attack_indices[0]]).strip()
+    shared_prefix = shared_prefix.rstrip(":").strip()
+    messages: list[str] = []
+    for index in attack_indices:
+        line = lines[index]
+        if shared_prefix and not line.casefold().startswith("auf "):
+            messages.append(f"{shared_prefix}:\n{line}")
+        else:
+            messages.append(line)
+    return messages
+
+
+def resolve_attack_message(
+    map_payload: dict[str, Any],
+    message_content: str,
+    noted_time: datetime,
+    defender_name_hint: str,
+) -> AttackResolution | None:
+    parsed = parse_attack_message(message_content)
+    if parsed is None:
+        return None
+
+    effective_defender_hint = (
+        defender_name_hint if parsed.use_message_author_for_defender else (parsed.defender_name_hint or defender_name_hint)
+    )
+    defender_name = get_most_similar_player_name(map_payload, effective_defender_hint)
+    attacker_name = get_most_similar_player_name(map_payload, parsed.attacker_hint)
+
+    defender_village, used_main_village = _resolve_defender_village(
+        map_payload=map_payload,
+        defender_name=defender_name,
+        defender_village_hint=parsed.defender_village_hint,
+    )
+    attacker_village = get_most_similar_village_of_player(
+        map_payload,
+        attacker_name,
+        parsed.attacking_village_hint,
+    )
+
+    arrival_time = _resolve_arrival_time(noted_time, parsed.arrival_time_text)
+    guesses = guess_tp_levels(
+        map_payload=map_payload,
+        noted_time=noted_time,
+        arrival_time=arrival_time,
+        attacker_village=attacker_village,
+        defender_village=defender_village,
+        is_siege=parsed.is_siege,
+    )
+
+    return AttackResolution(
+        parsed=parsed,
+        noted_time=noted_time,
+        arrival_time=arrival_time,
+        attacker=_find_player_match(map_payload, attacker_name),
+        defender=_find_player_match(map_payload, defender_name),
+        attacker_village=attacker_village,
+        defender_village=defender_village,
+        distance=village_distance(attacker_village, defender_village),
+        guesses=guesses,
+        defender_used_main_village=used_main_village,
+    )
+
+
+def build_player_link(server_url: str, player: PlayerMatch) -> str:
+    return f"{server_url.rstrip('/')}/#/playerId:{player.player_id}/"
+
+
+def build_village_link(server_url: str, village: Village) -> str:
+    return (
+        f"{server_url.rstrip('/')}/#/page:map/x:{village.x}/y:{village.y}/window:sendTroops"
+    )
+
+
+def translate(locale: str, key: str, **values: Any) -> str:
+    template = TRANSLATIONS.get(locale, TRANSLATIONS["de"])[key]
+    return template.format(**values)
+
+
+def format_guess(
+    guess: TravelGuess | None,
+    previous_tp_guess: TravelGuess | None,
+    distance: float,
+    locale: str = "de",
+) -> str:
+    if guess is None or not guess.starts_before_noted:
+        return "-"
+
+    start_time = format_time_short(guess.launch_time) if distance >= 20 else format_datetime_short(guess.launch_time)
+    if distance < 20:
+        speed = math.ceil((guess.speed_per_hour / 2) if guess.is_siege else guess.speed_per_hour)
+        text = translate(locale, "tp_below_20", speed=speed, start_time=start_time)
+    else:
+        text = translate(locale, "tp_value", tp_level=guess.tp_level, start_time=start_time)
+
+    if previous_tp_guess is not None and previous_tp_guess.starts_before_noted:
+        text += ", " + translate(
+            locale,
+            "tp_previous",
+            tp_level=previous_tp_guess.tp_level,
+            start_time=format_time_short(previous_tp_guess.launch_time),
+        )
+    return text
+
+
+def _clean_segment(value: str) -> str:
+    return " ".join(value.replace("\n", " ").split())
+
+
+def _extract_defender_override(content: str) -> tuple[str, str, str, bool] | None:
+    stripped = content.lstrip()
+    if not stripped.casefold().startswith("auf "):
+        return None
+
+    lines = stripped.splitlines()
+    if not lines:
+        return None
+
+    first_line = lines[0].strip()
+    after_auf = first_line[4:].strip()
+    remainder_lines = lines[1:]
+
+    if remainder_lines:
+        second_line = remainder_lines[0].strip()
+        if second_line and ATTACK_PATTERN.search(second_line) is None:
+            defender = _clean_segment(after_auf)
+            village = _clean_segment(second_line.rstrip(":"))
+            remaining = "\n".join(remainder_lines[1:]).strip()
+            if defender and village and remaining:
+                return defender, village, remaining, _is_self_reference(defender)
+
+    resolved = _split_inline_override_hint(after_auf)
+    if resolved is None or not remainder_lines:
+        return None
+
+    defender, village = resolved
+    remaining = "\n".join(remainder_lines).strip()
+    if not remaining:
+        return None
+    return defender, village.rstrip(":"), remaining, _is_self_reference(defender)
+
+
+def _split_inline_override_hint(value: str) -> tuple[str, str] | None:
+    cleaned = value.rstrip(":").strip()
+    if not cleaned:
+        return None
+    parts = cleaned.rsplit(None, 1)
+    if len(parts) != 2:
+        return None
+    defender, village = parts[0].strip(), parts[1].strip()
+    if not defender or not village:
+        return None
+    return defender, village
+
+
+def _is_self_reference(value: str) -> bool:
+    normalized = _clean_segment(value).casefold()
+    return normalized in {"mich", "mein", "uns", "unser"}
+
+
+def _resolve_defender_village(
+    map_payload: dict[str, Any],
+    defender_name: str,
+    defender_village_hint: str | None,
+) -> tuple[Village, bool]:
+    if defender_village_hint:
+        return (
+            get_most_similar_village_of_player(map_payload, defender_name, defender_village_hint),
+            False,
+        )
+
+    main_village = get_main_village_of_player(map_payload, defender_name)
+    if main_village is not None:
+        return main_village, True
+
+    villages = list_player_villages(map_payload, defender_name)
+    if not villages:
+        raise ValueError(f"Player has no villages: {defender_name}")
+    return villages[0], True
+
+
+def _find_player_match(map_payload: dict[str, Any], player_name: str) -> PlayerMatch:
+    for player in players_data(map_payload):
+        if str(player.get("name", "")).casefold() == player_name.casefold():
+            return PlayerMatch(
+                name=str(player.get("name", "")),
+                player_id=str(player.get("playerId", "")),
+            )
+    raise ValueError(f"Player not found: {player_name}")
+
+
+def _resolve_arrival_time(noted_time: datetime, arrival_text: str) -> datetime:
+    hours, minutes, seconds = (int(part) for part in arrival_text.split(":"))
+    arrival = datetime.combine(
+        noted_time.date(),
+        time(hour=hours, minute=minutes, second=seconds),
+        tzinfo=noted_time.tzinfo,
+    )
+    if arrival < noted_time:
+        arrival += timedelta(days=1)
+    return arrival
+
+
+def format_datetime_short(value: datetime) -> str:
+    localized = value.astimezone()
+    timezone_name = localized.tzname() or ""
+    abbreviations = {
+        "Mitteleuropaeische Sommerzeit": "MESZ",
+        "Mitteleuropäische Sommerzeit": "MESZ",
+        "Mitteleuropaeische Zeit": "MEZ",
+        "Mitteleuropäische Zeit": "MEZ",
+        "Central European Summer Time": "CEST",
+        "Central European Standard Time": "CET",
+    }
+    timezone_text = abbreviations.get(timezone_name, timezone_name)
+    return localized.strftime("%Y-%m-%d %H:%M:%S").strip() + (f" {timezone_text}" if timezone_text else "")
+
+
+def format_time_short(value: datetime) -> str:
+    localized = value.astimezone()
+    timezone_name = localized.tzname() or ""
+    abbreviations = {
+        "Mitteleuropaeische Sommerzeit": "MESZ",
+        "Mitteleuropäische Sommerzeit": "MESZ",
+        "Mitteleuropaeische Zeit": "MEZ",
+        "Mitteleuropäische Zeit": "MEZ",
+        "Central European Summer Time": "CEST",
+        "Central European Standard Time": "CET",
+    }
+    timezone_text = abbreviations.get(timezone_name, timezone_name)
+    return localized.strftime("%H:%M:%S").strip() + (f" {timezone_text}" if timezone_text else "")
+
+
+def format_duration_hms(start: datetime, end: datetime) -> str:
+    total_seconds = max(0, int((end - start).total_seconds()))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02}:{minutes:02}:{seconds:02}"
+
+
+def get_short_distance_speed(distance: float, noted_time: datetime, arrival_time: datetime) -> int | None:
+    total_seconds = (arrival_time - noted_time).total_seconds()
+    if total_seconds <= 0:
+        return None
+    hours = total_seconds / 3600
+    if hours <= 0:
+        return None
+    exact_speed = distance / hours
+    candidate_speed = max(1, math.ceil(exact_speed))
+    while candidate_speed > 1:
+        launch_time = get_short_distance_launch_time(distance, arrival_time, candidate_speed)
+        if launch_time <= noted_time:
+            return candidate_speed
+        candidate_speed -= 1
+
+    launch_time = get_short_distance_launch_time(distance, arrival_time, 1)
+    if launch_time <= noted_time:
+        return 1
+    return None
+
+
+def get_short_distance_launch_time(
+    distance: float,
+    arrival_time: datetime,
+    speed: int,
+) -> datetime:
+    travel_seconds = math.floor((distance / speed) * 3600)
+    launch_time = arrival_time.timestamp() - travel_seconds
+    return datetime.fromtimestamp(launch_time, tz=arrival_time.tzinfo)
+
+
+def get_previous_tp_guess(
+    guess: TravelGuess | None,
+    arrival_time: datetime,
+    noted_time: datetime,
+) -> TravelGuess | None:
+    if guess is None or guess.tp_level <= 0:
+        return None
+    return build_travel_guess(
+        noted_time=noted_time,
+        arrival_time=arrival_time,
+        distance=guess.distance,
+        speed_per_hour=guess.speed_per_hour,
+        base_speed=guess.base_speed,
+        tp_level=guess.tp_level - 1,
+        is_siege=guess.is_siege,
+    )

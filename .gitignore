@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+raspberry-pi-info.txt
+logs/
+raspberry-logs/
