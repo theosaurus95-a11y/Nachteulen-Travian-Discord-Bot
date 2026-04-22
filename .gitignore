@@ -3,5 +3,9 @@
 __pycache__/
 *.pyc
 raspberry-pi-info.txt
+deploy-to-raspberry-pi.ps1
+get-raspberry-log.ps1
+initialize-raspberry-pi.ps1
+setup-raspberry-ssh-key.ps1
 logs/
 raspberry-logs/

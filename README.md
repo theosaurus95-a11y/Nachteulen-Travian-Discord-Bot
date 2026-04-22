@@ -172,42 +172,6 @@ A Discord bot must stay online to respond to messages. That means you need an **
 - A VPS
 - A cloud platform that supports long-running worker services
 
-### Raspberry Pi im Heimnetz
-
-Wenn ein Raspberry Pi mit SSH erreichbar ist, kannst du ihn mit den beiden PowerShell-Skripten aus diesem Repository einrichten und deployen.
-
-Lege lokal eine Datei `raspberry-pi-info.txt` an:
-
-```text
-Hostname: christoph-rpi
-Benutzername: christoph
-Passwort: dein-passwort
-```
-
-Erstinitialisierung auf dem Pi:
-
-```powershell
-.\initialize-raspberry-pi.ps1
-```
-
-Das Skript installiert Python-Pakete auf dem Pi, erstellt `/home/christoph/discord-bot`, legt eine `.venv` an und richtet einen `systemd`-Service namens `travian-discord-bot` ein.
-
-Optional, aber empfohlen: SSH-Key-Login einrichten, damit `ssh` und `scp` nicht jedes Mal nach dem Pi-Passwort fragen:
-
-```powershell
-.\setup-raspberry-ssh-key.ps1
-```
-
-Danach verwenden `initialize-raspberry-pi.ps1` und `deploy-to-raspberry-pi.ps1` den Key automatisch, sofern er unter `%USERPROFILE%\.ssh\travian_bot_rpi` liegt.
-
-Bei Code-Aenderungen deployen und den Bot auf dem Pi neustarten:
-
-```powershell
-.\deploy-to-raspberry-pi.ps1
-```
-
-Das Deploy-Skript kopiert die notwendigen Projektdateien inklusive `.env` und `travian-map-data.json`, installiert Python-Dependencies im Pi-venv, prueft die Python-Dateien und startet den Service neu.
-
 Der Bot schreibt wichtige Ereignisse, Warnungen und Fehler in eine rotierende Logdatei. Standard:
 
 ```env
@@ -216,17 +180,7 @@ LOG_MAX_BYTES=1048576
 LOG_BACKUP_COUNT=6
 ```
 
-Damit bleiben maximal etwa 7 MB Bot-Logs erhalten. Das sollte bei normalem Betrieb eher 12-24 Stunden abdecken, ohne den kleinen Raspberry-Pi-Speicher unkontrolliert zu fuellen. Die aktuelle Logdatei vom Pi kannst du lokal abrufen mit:
-
-```powershell
-.\get-raspberry-log.ps1
-```
-
-Wenn du auch rotierte Dateien wie `bot.log.1` abholen willst:
-
-```powershell
-.\get-raspberry-log.ps1 -IncludeRotated
-```
+Damit bleiben maximal etwa 7 MB Bot-Logs erhalten. Das sollte bei normalem Betrieb eher 12-24 Stunden abdecken.
 
 For a beginner, these are the simplest options:
 
