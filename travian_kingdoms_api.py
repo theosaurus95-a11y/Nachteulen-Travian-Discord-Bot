@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 
@@ -43,6 +43,17 @@ class TravelGuess:
 
 KATAPULT_SPEED = 3
 RAM_SPEED = 4
+REDACTED_VALUE = "REDACTED"
+SENSITIVE_QUERY_PARAMS = {
+    "apikey",
+    "privateapikey",
+    "publicsitekey",
+    "token",
+    "access_token",
+    "refresh_token",
+    "password",
+    "secret",
+}
 
 
 def load_dotenv(env_path: str = ".env") -> None:
@@ -71,7 +82,51 @@ def build_endpoint(server_url: str, action: str, **params: Any) -> str:
     return f"{server_url}/api/external.php?{urlencode(query)}"
 
 
+def is_sensitive_query_param(name: str) -> bool:
+    return name.casefold() in SENSITIVE_QUERY_PARAMS
+
+
+def sensitive_query_values(url: str) -> list[str]:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return []
+
+    return [
+        value
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if value and is_sensitive_query_param(key)
+    ]
+
+
+def redact_text(value: str, sensitive_values: list[str]) -> str:
+    redacted = value
+    for sensitive_value in sorted(set(sensitive_values), key=len, reverse=True):
+        redacted = redacted.replace(sensitive_value, REDACTED_VALUE)
+    return redacted
+
+
+def redact_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return "<redacted url>"
+
+    query_items = parse_qsl(parsed.query, keep_blank_values=True)
+    redacted_query = urlencode(
+        [
+            (key, REDACTED_VALUE if is_sensitive_query_param(key) else value)
+            for key, value in query_items
+        ]
+    )
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, redacted_query, parsed.fragment)
+    )
+
+
 def fetch_json(url: str) -> dict[str, Any]:
+    safe_url = redact_url(url)
+    sensitive_values = sensitive_query_values(url)
     request = Request(
         url,
         headers={
@@ -88,12 +143,12 @@ def fetch_json(url: str) -> dict[str, Any]:
         try:
             preview = exc.read(400).decode("utf-8", "ignore").strip()
             if preview:
-                details = f" Response preview: {preview}"
+                details = f" Response preview: {redact_text(preview, sensitive_values)}"
         except Exception:
             details = ""
-        raise RuntimeError(f"HTTP error {exc.code} while calling {url}.{details}") from exc
+        raise RuntimeError(f"HTTP error {exc.code} while calling {safe_url}.{details}") from exc
     except URLError as exc:
-        raise RuntimeError(f"Network error while calling {url}: {exc.reason}") from exc
+        raise RuntimeError(f"Network error while calling {safe_url}: {exc.reason}") from exc
 
     try:
         data = json.loads(payload)

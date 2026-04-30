@@ -51,12 +51,14 @@ Optional channel and runtime settings:
 ```env
 COMMAND_PREFIX=!
 WATCH_CHANNEL_IDS=1493215975288471607,1493215975288471608
-WATCH_ALL_CHANNELS=false
 OUTPUT_CHANNEL_ID=1493215975288471608
 BOT_LOCALE=de
 ATTACK_HISTORY_PATH=attack-history.json
 LOG_FILE_PATH=logs/bot.log
+UPDATE_TK_COOLDOWN_SECONDS=300
 ```
+
+The bot rejects direct messages and only reacts in channels listed in `WATCH_CHANNEL_IDS`.
 
 ## Run
 

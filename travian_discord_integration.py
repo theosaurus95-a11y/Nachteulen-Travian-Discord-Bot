@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from travian_kingdoms_api import (
+    KATAPULT_SPEED,
+    RAM_SPEED,
     TravelGuess,
     Village,
     build_travel_guess,
@@ -16,8 +18,11 @@ from travian_kingdoms_api import (
     guess_tp_levels,
     list_player_villages,
     players_data,
+    speed_troops_from_payload,
+    troop_speed_per_hour,
     village_distance,
 )
+from troop_speeds import get_possible_base_speeds_x1, get_possible_world_speeds
 
 
 ATTACK_PATTERN = re.compile(
@@ -30,6 +35,9 @@ ATTACK_PATTERN = re.compile(
     r"in\s*(?P<travel_time>\d{1,2}:\d{2}:\d{2})\s+"
     r"(?:um|at)\s+(?P<arrival_time>\d{1,2}:\d{2}:\d{2})"
 )
+SINCE_LINE_PATTERN = re.compile(r"(?i)^\s*seit\s+(?P<value>.+?)\s*$")
+TIME_ONLY_PATTERN = re.compile(r"^\s*(?P<hour>\d{1,2}):(?P<minute>\d{2})(?::(?P<second>\d{2}))?\s*$")
+MAX_STANDARD_GUESS_AGE_SECONDS = 60 * 60
 
 @dataclass(frozen=True)
 class ParsedAttackMessage:
@@ -37,6 +45,7 @@ class ParsedAttackMessage:
     defender_name_hint: str | None
     defender_village_hint: str | None
     use_message_author_for_defender: bool
+    visible_since_text: str | None
     attacker_hint: str
     attacking_village_hint: str
     travel_time_text: str
@@ -61,6 +70,7 @@ class AttackResolution:
     defender_village: Village
     distance: float
     guesses: dict[str, TravelGuess | None]
+    alternative_guess: TravelGuess | None
     defender_used_main_village: bool
 
 
@@ -81,6 +91,7 @@ TRANSLATIONS = {
         "katapult": "Katapulte",
         "tp_below_20": "Geschwindigkeit `{speed}`, Start `{start_time}`",
         "tp_value": "TP `{tp_level}`, Start `{start_time}`",
+        "speed_without_tp": "`{speed}`, ohne TP, Start `{start_time}`",
         "tp_previous": "Mit TP `{tp_level}` haette schon um `{start_time}` gestartet werden muessen",
         "no_valid_guess": "Keine gueltige Schaetzung",
     }
@@ -102,6 +113,8 @@ def parse_attack_message(content: str) -> ParsedAttackMessage | None:
     override = _extract_defender_override(compact)
     if override is not None:
         defender_name_hint, defender_village_hint, compact, use_message_author_for_defender = override
+
+    visible_since_text, compact = _extract_visible_since_hint(compact)
 
     prefix_match = re.match(r"(?s)^\s*([^:\n]{1,80})\s*:\s*(.+)$", compact)
     if prefix_match:
@@ -126,6 +139,7 @@ def parse_attack_message(content: str) -> ParsedAttackMessage | None:
         defender_name_hint=defender_name_hint,
         defender_village_hint=defender_village_hint,
         use_message_author_for_defender=use_message_author_for_defender,
+        visible_since_text=visible_since_text,
         attacker_hint=_clean_segment(match.group("attacker")),
         attacking_village_hint=_clean_segment(match.group("attacking_village")),
         travel_time_text=match.group("travel_time"),
@@ -144,12 +158,11 @@ def split_attack_messages(content: str) -> list[str]:
         return [content]
 
     shared_prefix = "\n".join(lines[:attack_indices[0]]).strip()
-    shared_prefix = shared_prefix.rstrip(":").strip()
     messages: list[str] = []
     for index in attack_indices:
         line = lines[index]
         if shared_prefix and not line.casefold().startswith("auf "):
-            messages.append(f"{shared_prefix}:\n{line}")
+            messages.append(f"{shared_prefix}\n{line}")
         else:
             messages.append(line)
     return messages
@@ -160,13 +173,25 @@ def resolve_attack_message(
     message_content: str,
     noted_time: datetime,
     defender_name_hint: str,
+    defender_name_override: str | None = None,
+    defender_village_override: str | None = None,
+    noted_time_hint: str | None = None,
 ) -> AttackResolution | None:
     parsed = parse_attack_message(message_content)
     if parsed is None:
         return None
 
+    effective_noted_time = parse_flexible_noted_time(
+        noted_time,
+        noted_time_hint or parsed.visible_since_text,
+    ) or noted_time
     effective_defender_hint = (
-        defender_name_hint if parsed.use_message_author_for_defender else (parsed.defender_name_hint or defender_name_hint)
+        defender_name_override
+        or (
+            defender_name_hint
+            if parsed.use_message_author_for_defender
+            else (parsed.defender_name_hint or defender_name_hint)
+        )
     )
     defender_name = get_most_similar_player_name(map_payload, effective_defender_hint)
     attacker_name = get_most_similar_player_name(map_payload, parsed.attacker_hint)
@@ -174,7 +199,7 @@ def resolve_attack_message(
     defender_village, used_main_village = _resolve_defender_village(
         map_payload=map_payload,
         defender_name=defender_name,
-        defender_village_hint=parsed.defender_village_hint,
+        defender_village_hint=defender_village_override or parsed.defender_village_hint,
     )
     attacker_village = get_most_similar_village_of_player(
         map_payload,
@@ -182,19 +207,32 @@ def resolve_attack_message(
         parsed.attacking_village_hint,
     )
 
-    arrival_time = _resolve_arrival_time(noted_time, parsed.arrival_time_text)
+    arrival_time = _resolve_arrival_time(effective_noted_time, parsed.arrival_time_text)
     guesses = guess_tp_levels(
         map_payload=map_payload,
-        noted_time=noted_time,
+        noted_time=effective_noted_time,
         arrival_time=arrival_time,
         attacker_village=attacker_village,
         defender_village=defender_village,
         is_siege=parsed.is_siege,
     )
+    alternative_guess = None
+    if _should_guess_alternative_speed(
+        distance=village_distance(attacker_village, defender_village),
+        guesses=guesses,
+    ):
+        alternative_guess = guess_alternative_speed(
+            map_payload=map_payload,
+            noted_time=effective_noted_time,
+            arrival_time=arrival_time,
+            attacker_village=attacker_village,
+            defender_village=defender_village,
+            is_siege=parsed.is_siege,
+        )
 
     return AttackResolution(
         parsed=parsed,
-        noted_time=noted_time,
+        noted_time=effective_noted_time,
         arrival_time=arrival_time,
         attacker=_find_player_match(map_payload, attacker_name),
         defender=_find_player_match(map_payload, defender_name),
@@ -202,12 +240,16 @@ def resolve_attack_message(
         defender_village=defender_village,
         distance=village_distance(attacker_village, defender_village),
         guesses=guesses,
+        alternative_guess=alternative_guess,
         defender_used_main_village=used_main_village,
     )
 
 
 def build_player_link(server_url: str, player: PlayerMatch) -> str:
-    return f"{server_url.rstrip('/')}/#/playerId:{player.player_id}/"
+    return (
+        f"{server_url.rstrip('/')}/#/page:map/window:playerProfile/"
+        f"playerId:{player.player_id}"
+    )
 
 
 def build_village_link(server_url: str, village: Village) -> str:
@@ -247,8 +289,58 @@ def format_guess(
     return text
 
 
+def format_speed_guess(
+    guess: TravelGuess | None,
+    locale: str = "de",
+) -> str:
+    if guess is None or not guess.starts_before_noted:
+        return "-"
+
+    return translate(
+        locale,
+        "speed_without_tp",
+        speed=_display_speed_for_guess(guess),
+        start_time=format_time_short(guess.launch_time),
+    )
+
+
+def _display_speed_for_guess(guess: TravelGuess) -> int:
+    speed = (guess.speed_per_hour / 2) if guess.is_siege else guess.speed_per_hour
+    return math.ceil(speed)
+
+
+def is_recent_standard_guess(guess: TravelGuess | None) -> bool:
+    return (
+        guess is not None
+        and guess.starts_before_noted
+        and 0 <= guess.note_gap_seconds <= MAX_STANDARD_GUESS_AGE_SECONDS
+    )
+
+
 def _clean_segment(value: str) -> str:
     return " ".join(value.replace("\n", " ").split())
+
+
+def _extract_visible_since_hint(content: str) -> tuple[str | None, str]:
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if not lines:
+        return None, content.strip()
+
+    since_index = None
+    since_value: str | None = None
+    for index, line in enumerate(lines):
+        match = SINCE_LINE_PATTERN.fullmatch(line)
+        if match is None:
+            continue
+        since_index = index
+        since_value = _clean_segment(match.group("value"))
+        break
+
+    if since_index is None or not since_value:
+        return None, content.strip()
+
+    remaining_lines = lines[:since_index] + lines[since_index + 1 :]
+    return since_value, "\n".join(remaining_lines).strip()
 
 
 def _extract_defender_override(content: str) -> tuple[str, str, str, bool] | None:
@@ -300,6 +392,54 @@ def _split_inline_override_hint(value: str) -> tuple[str, str] | None:
 def _is_self_reference(value: str) -> bool:
     normalized = _clean_segment(value).casefold()
     return normalized in {"mich", "mein", "uns", "unser"}
+
+
+def parse_flexible_noted_time(reference_time: datetime, raw_value: str | None) -> datetime | None:
+    if not raw_value:
+        return None
+
+    cleaned = " ".join(raw_value.strip().replace("T", " ").split())
+    if not cleaned:
+        return None
+    if cleaned.casefold().endswith(" uhr"):
+        cleaned = cleaned[:-4].strip()
+
+    for time_format in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+    ):
+        try:
+            parsed = datetime.strptime(cleaned, time_format)
+        except ValueError:
+            continue
+
+        candidate = parsed.replace(tzinfo=reference_time.tzinfo)
+        if candidate > reference_time:
+            return None
+        return candidate
+
+    match = TIME_ONLY_PATTERN.fullmatch(cleaned)
+    if match is None:
+        return None
+
+    hours = int(match.group("hour"))
+    minutes = int(match.group("minute"))
+    seconds = int(match.group("second") or "0")
+    if hours > 23 or minutes > 59 or seconds > 59:
+        return None
+
+    candidate = datetime.combine(
+        reference_time.date(),
+        time(hour=hours, minute=minutes, second=seconds),
+        tzinfo=reference_time.tzinfo,
+    )
+    if candidate > reference_time:
+        candidate -= timedelta(days=1)
+    return candidate
 
 
 def _resolve_defender_village(
@@ -403,6 +543,24 @@ def get_short_distance_speed(distance: float, noted_time: datetime, arrival_time
     return None
 
 
+def get_short_distance_speed_with_world_limit(
+    map_payload: dict[str, Any],
+    distance: float,
+    noted_time: datetime,
+    arrival_time: datetime,
+) -> int | None:
+    speed_troops = speed_troops_from_payload(map_payload)
+    possible_speeds = get_possible_world_speeds(speed_troops)
+    valid_speeds = [
+        speed
+        for speed in possible_speeds
+        if get_short_distance_launch_time(distance, arrival_time, speed) <= noted_time
+    ]
+    if not valid_speeds:
+        return None
+    return max(valid_speeds)
+
+
 def get_short_distance_launch_time(
     distance: float,
     arrival_time: datetime,
@@ -429,3 +587,52 @@ def get_previous_tp_guess(
         tp_level=guess.tp_level - 1,
         is_siege=guess.is_siege,
     )
+
+
+def _should_guess_alternative_speed(
+    distance: float,
+    guesses: dict[str, TravelGuess | None],
+) -> bool:
+    if distance <= 20:
+        return False
+
+    return not all(
+        is_recent_standard_guess(guesses.get(unit_name))
+        for unit_name in ("ram", "katapult")
+    )
+
+
+def guess_alternative_speed(
+    map_payload: dict[str, Any],
+    noted_time: datetime,
+    arrival_time: datetime,
+    attacker_village: Village,
+    defender_village: Village,
+    is_siege: bool,
+) -> TravelGuess | None:
+    best_valid_guess: TravelGuess | None = None
+    best_fallback_guess: TravelGuess | None = None
+    speed_troops = speed_troops_from_payload(map_payload)
+    distance = village_distance(attacker_village, defender_village)
+
+    for base_speed in get_possible_base_speeds_x1():
+        if base_speed in {RAM_SPEED, KATAPULT_SPEED}:
+            continue
+        guess = build_travel_guess(
+            noted_time=noted_time,
+            arrival_time=arrival_time,
+            distance=distance,
+            speed_per_hour=troop_speed_per_hour(base_speed, speed_troops),
+            base_speed=base_speed,
+            tp_level=0,
+            is_siege=is_siege,
+        )
+
+        if guess.starts_before_noted:
+            if best_valid_guess is None or guess.note_gap_seconds < best_valid_guess.note_gap_seconds:
+                best_valid_guess = guess
+        else:
+            if best_fallback_guess is None or abs(guess.note_gap_seconds) < abs(best_fallback_guess.note_gap_seconds):
+                best_fallback_guess = guess
+
+    return best_valid_guess or best_fallback_guess

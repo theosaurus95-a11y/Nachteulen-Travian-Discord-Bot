@@ -86,9 +86,13 @@ def build_history_entry(resolution: Any, message_url: str) -> dict[str, Any]:
         "attackerPlayer": resolution.attacker.name,
         "attackerVillage": resolution.attacker_village.name,
         "attackerVillageId": resolution.attacker_village.village_id,
+        "attackerX": resolution.attacker_village.x,
+        "attackerY": resolution.attacker_village.y,
         "defenderPlayer": resolution.defender.name,
         "defenderVillage": resolution.defender_village.name,
         "defenderVillageId": resolution.defender_village.village_id,
+        "defenderX": resolution.defender_village.x,
+        "defenderY": resolution.defender_village.y,
         "candidates": [
             _build_candidate_entry("katapult", KATAPULT_SPEED, resolution),
             _build_candidate_entry("ram", RAM_SPEED, resolution),

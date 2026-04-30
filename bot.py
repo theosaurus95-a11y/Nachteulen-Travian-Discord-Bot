@@ -2,10 +2,12 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 import json
+import time
 from pathlib import Path
 from collections import Counter, defaultdict
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 
 from bot_runtime import (
@@ -21,15 +23,20 @@ from travian_discord_integration import (
     format_guess,
     format_datetime_short,
     format_duration_hms,
+    format_speed_guess,
+    is_recent_standard_guess,
+    parse_flexible_noted_time,
     get_previous_tp_guess,
     get_short_distance_launch_time,
-    get_short_distance_speed,
+    get_short_distance_speed_with_world_limit,
     load_map_payload,
     resolve_attack_message,
     split_attack_messages,
     translate,
 )
 from travian_kingdoms_api import build_summary
+from travian_kingdoms_api import players_data
+from travian_kingdoms_api import request_api_key
 
 
 def load_dotenv(env_path: str = ".env") -> None:
@@ -64,13 +71,17 @@ raw_channel_ids = os.getenv("WATCH_CHANNEL_IDS", "")
 TRAVIAN_SERVER_URL = os.getenv("TRAVIAN_SERVER_URL", "").strip()
 TRAVIAN_MAP_DATA_PATH = os.getenv("TRAVIAN_MAP_DATA_PATH", "travian-map-data.json")
 TRAVIAN_PRIVATE_API_KEY = os.getenv("TRAVIAN_PRIVATE_API_KEY", "").strip() or None
+TRAVIAN_TOOL_EMAIL = os.getenv("TRAVIAN_TOOL_EMAIL", "").strip()
+TRAVIAN_TOOL_NAME = os.getenv("TRAVIAN_TOOL_NAME", "").strip()
+TRAVIAN_TOOL_URL = os.getenv("TRAVIAN_TOOL_URL", "").strip()
+TRAVIAN_TOOL_PUBLIC = os.getenv("TRAVIAN_TOOL_PUBLIC", "false").strip().lower() == "true"
 ATTACK_HISTORY_PATH = os.getenv("ATTACK_HISTORY_PATH", "attack-history.json")
 BOT_LOCALE = os.getenv("BOT_LOCALE", "de").strip() or "de"
-WATCH_ALL_CHANNELS = os.getenv("WATCH_ALL_CHANNELS", "false").strip().lower() == "true"
 OUTPUT_CHANNEL_ID = int(os.getenv("OUTPUT_CHANNEL_ID", "0").strip() or "0")
 LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "logs/bot.log")
 LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", "1048576"))
 LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "6"))
+UPDATE_TK_COOLDOWN_SECONDS = int(os.getenv("UPDATE_TK_COOLDOWN_SECONDS", "300"))
 
 if not TOKEN:
     raise RuntimeError(
@@ -87,6 +98,12 @@ WATCH_CHANNEL_IDS = {
     for channel_id in raw_channel_ids.split(",")
     if channel_id.strip()
 }
+
+DM_REJECTION_TEXT = (
+    "Ich nehme keine Direktnachrichten an. "
+    "Bitte nutze einen konfigurierten Watch-Kanal auf dem Discord-Server."
+)
+WATCH_CHANNEL_REJECTION_TEXT = "Ich reagiere nur in den konfigurierten Watch-Kanaelen."
 
 
 def configure_file_logging() -> None:
@@ -117,6 +134,70 @@ def configure_file_logging() -> None:
 
 configure_file_logging()
 
+
+def is_missing_travian_key(private_api_key: str | None) -> bool:
+    return not private_api_key or private_api_key.lower() == "replace_me"
+
+
+def update_env_value(key: str, value: str, env_path: str = ".env") -> None:
+    path = Path(env_path)
+    lines = path.read_text(encoding="utf-8-sig").splitlines() if path.exists() else []
+    updated = False
+    new_lines = []
+
+    for line in lines:
+        if line.strip().startswith("#") or "=" not in line:
+            new_lines.append(line)
+            continue
+
+        current_key, _ = line.split("=", 1)
+        if current_key.strip().lstrip("\ufeff") == key:
+            new_lines.append(f"{key}={value}")
+            updated = True
+        else:
+            new_lines.append(line)
+
+    if not updated:
+        new_lines.append(f"{key}={value}")
+
+    path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    os.environ[key] = value
+
+
+def request_and_store_travian_api_key() -> str | None:
+    missing_fields = [
+        name
+        for name, value in [
+            ("TRAVIAN_TOOL_EMAIL", TRAVIAN_TOOL_EMAIL),
+            ("TRAVIAN_TOOL_NAME", TRAVIAN_TOOL_NAME),
+            ("TRAVIAN_TOOL_URL", TRAVIAN_TOOL_URL),
+        ]
+        if not value or value.lower() == "replace_me"
+    ]
+    if missing_fields:
+        logging.warning(
+            "Travian API-Schluessel kann nicht automatisch angefordert werden. "
+            "Fehlende Konfiguration: %s",
+            ", ".join(missing_fields),
+        )
+        return None
+
+    result = request_api_key(
+        server_url=TRAVIAN_SERVER_URL,
+        email=TRAVIAN_TOOL_EMAIL,
+        site_name=TRAVIAN_TOOL_NAME,
+        site_url=TRAVIAN_TOOL_URL,
+        is_public=TRAVIAN_TOOL_PUBLIC,
+    )
+    private_api_key = str(result.get("response", {}).get("privateApiKey", "")).strip()
+    if not private_api_key:
+        logging.warning("Travian API-Schluessel-Anfrage lieferte keinen privateApiKey.")
+        return None
+
+    update_env_value("TRAVIAN_PRIVATE_API_KEY", private_api_key)
+    logging.info("Neuer Travian API-Schluessel wurde angefordert und in .env gespeichert.")
+    return private_api_key
+
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -126,6 +207,8 @@ _travian_map_payload: dict | None = None
 _travian_map_mtime_ns: int | None = None
 _last_maintenance_date: str | None = None
 _pending_history_summary: list[str] = []
+_update_tk_cooldown_until: dict[int, float] = {}
+_update_tk_running_scopes: set[int] = set()
 history_store = AttackHistoryStore(ATTACK_HISTORY_PATH)
 
 HELP_LINES = [
@@ -136,8 +219,13 @@ HELP_LINES = [
     f"`{PREFIX}ping` - Zeigt die aktuelle Bot-Latenz",
     f"`{PREFIX}hallo` oder `{PREFIX}hello` - Kurzer Funktionstest",
     f"`{PREFIX}summary` - Fasst die gespeicherten Angriffe zusammen",
+    f"`{PREFIX}summarydorf` - Fasst die gespeicherten Angriffe nach Zieldorf zusammen",
+    f"`{PREFIX}angreiferliste` - Gibt Angreiferdoerfer tabellarisch zum Kopieren aus",
+    f"`{PREFIX}verteidigerliste` - Gibt Zieldoerfer tabellarisch zum Kopieren aus",
     f"`{PREFIX}reset` - Leert die Angriffshistorie",
     f"`{PREFIX}updateTK` - Aktualisiert die Travian-Kartendaten manuell",
+    f"`{PREFIX}meldeformat` - Zeigt das empfohlene Format fuer manuelle Meldungen",
+    "`/melden` - Meldet einen Angriff strukturiert mit optionalem `seit`-Zeitpunkt",
     "",
     "Angriffsmeldungen in den beobachteten Kanaelen werden automatisch ausgewertet.",
 ]
@@ -233,6 +321,21 @@ def build_tp_summary(entries: list[dict]) -> str:
     return ", ".join(parts)
 
 
+async def send_attack_embed_and_track(
+    output_channel: discord.abc.Messageable,
+    embed: discord.Embed,
+    resolution: object,
+    source_message_url: str,
+) -> None:
+    history_store.add(build_history_entry(resolution, source_message_url))
+    sent_message = await output_channel.send(embed=embed)
+    history_store.set_bot_message_url(
+        resolution.attacker_village.village_id,
+        resolution.defender_village.village_id,
+        sent_message.jump_url,
+    )
+
+
 def build_history_summary_chunks(
     entries: list[dict],
     title: str = "Zusammenfassung der Angriffshistorie:",
@@ -271,6 +374,185 @@ def build_history_summary_chunks(
     return chunks
 
 
+def build_defender_village_summary_chunks(
+    entries: list[dict],
+    title: str = "Zusammenfassung der Angriffshistorie nach Zieldorf:",
+) -> list[str]:
+    if not entries:
+        return []
+
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for entry in entries:
+        target = f"{entry.get('defenderPlayer', '?')} / {entry.get('defenderVillage', '?')}"
+        grouped[target].append(entry)
+
+    lines = [title]
+    for target, target_entries in sorted(
+        grouped.items(),
+        key=lambda item: (-len(item[1]), item[0].casefold()),
+    ):
+        lines.append(
+            f"{target}: {len(target_entries)} Angriff(e), Gesamt-TP {build_tp_summary(target_entries)}"
+        )
+        for entry in target_entries:
+            source = f"{entry.get('attackerPlayer', '?')} / {entry.get('attackerVillage', '?')}"
+            link = entry.get("botMessageUrl") or entry.get("messageUrl") or "-"
+            lines.append(f"- {source}: {link}")
+
+    chunks: list[str] = []
+    current = ""
+    for line in lines:
+        candidate = f"{current}\n{line}".strip() if current else line
+        if len(candidate) > 1900 and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def build_map_village_lookup(map_payload: dict) -> dict[str, dict[str, object]]:
+    lookup: dict[str, dict[str, object]] = {}
+    for player in players_data(map_payload):
+        player_name = str(player.get("name", ""))
+        for village in player.get("villages", []):
+            village_id = str(village.get("villageId", ""))
+            if not village_id:
+                continue
+            lookup[village_id] = {
+                "player": player_name,
+                "village": village.get("name", ""),
+                "x": village.get("x", ""),
+                "y": village.get("y", ""),
+            }
+    return lookup
+
+
+def build_history_village_tsv_chunks(
+    entries: list[dict],
+    *,
+    role: str,
+    map_payload: dict,
+) -> list[str]:
+    if role == "attacker":
+        village_key = "attackerVillage"
+        player_key = "attackerPlayer"
+        village_id_key = "attackerVillageId"
+        x_key = "attackerX"
+        y_key = "attackerY"
+        header = "Dorf\tAngreifer\tX-Koordinate\tY-Koordinate"
+    elif role == "defender":
+        village_key = "defenderVillage"
+        player_key = "defenderPlayer"
+        village_id_key = "defenderVillageId"
+        x_key = "defenderX"
+        y_key = "defenderY"
+        header = "Dorf\tVerteidiger\tX-Koordinate\tY-Koordinate"
+    else:
+        raise ValueError(f"Unknown village export role: {role}")
+
+    village_lookup = build_map_village_lookup(map_payload)
+    seen: set[str] = set()
+    rows: list[tuple[str, str, str, str]] = []
+    for entry in entries:
+        village_id = str(entry.get(village_id_key, ""))
+        map_village = village_lookup.get(village_id, {})
+        village = _first_present(entry.get(village_key), map_village.get("village"))
+        player = _first_present(entry.get(player_key), map_village.get("player"))
+        x = _first_present(entry.get(x_key), map_village.get("x"))
+        y = _first_present(entry.get(y_key), map_village.get("y"))
+        unique_key = village_id or f"{player}\0{village}"
+        if unique_key in seen:
+            continue
+        seen.add(unique_key)
+        rows.append(
+            (
+                _format_tsv_cell(village),
+                _format_tsv_cell(player),
+                _format_tsv_cell(x),
+                _format_tsv_cell(y),
+            )
+        )
+
+    rows.sort(key=lambda row: (row[1].casefold(), row[0].casefold(), row[2], row[3]))
+    return _chunk_tsv_lines([header, *["\t".join(row) for row in rows]])
+
+
+def _first_present(*values: object) -> object:
+    for value in values:
+        if value is None:
+            continue
+        if str(value) == "":
+            continue
+        return value
+    return ""
+
+
+def _format_tsv_cell(value: object) -> str:
+    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
+def _chunk_tsv_lines(lines: list[str], max_message_length: int = 1900) -> list[str]:
+    if not lines:
+        return []
+
+    header = lines[0]
+    chunks: list[str] = []
+    current_lines = [header]
+    for line in lines[1:]:
+        candidate_lines = [*current_lines, line]
+        candidate = "\n".join(candidate_lines)
+        if len(candidate) > max_message_length and len(current_lines) > 1:
+            chunks.append("\n".join(current_lines))
+            current_lines = [header, line]
+        else:
+            current_lines = candidate_lines
+
+    if current_lines:
+        chunks.append("\n".join(current_lines))
+    return chunks
+
+
+def get_context_scope_id(ctx: commands.Context) -> int:
+    if ctx.guild is not None:
+        return ctx.guild.id
+    return ctx.channel.id
+
+
+def format_cooldown_remaining(seconds: float) -> str:
+    total_seconds = max(1, int(seconds + 0.999))
+    minutes, seconds = divmod(total_seconds, 60)
+    if minutes and seconds:
+        return f"{minutes}m {seconds}s"
+    if minutes:
+        return f"{minutes}m"
+    return f"{seconds}s"
+
+
+def claim_update_tk_run(scope_id: int) -> str | None:
+    if scope_id in _update_tk_running_scopes:
+        return "Das Travian-Update laeuft bereits. Bitte warte kurz, bis es fertig ist."
+
+    now = time.monotonic()
+    cooldown_until = _update_tk_cooldown_until.get(scope_id, 0.0)
+    remaining_seconds = cooldown_until - now
+    if remaining_seconds > 0:
+        return (
+            "Das Travian-Update wurde gerade erst gestartet. "
+            f"Bitte warte noch {format_cooldown_remaining(remaining_seconds)}."
+        )
+
+    _update_tk_running_scopes.add(scope_id)
+    _update_tk_cooldown_until[scope_id] = now + UPDATE_TK_COOLDOWN_SECONDS
+    return None
+
+
+def release_update_tk_run(scope_id: int) -> None:
+    _update_tk_running_scopes.discard(scope_id)
+
+
 def prepare_history_reset_summary(title: str) -> list[str]:
     entries = history_store.list_entries()
     if len(entries) <= 10:
@@ -280,11 +562,16 @@ def prepare_history_reset_summary(title: str) -> list[str]:
 
 def run_startup_maintenance() -> None:
     global _pending_history_summary
+    global TRAVIAN_PRIVATE_API_KEY
     logging.info("Startup maintenance started.")
     _pending_history_summary = prepare_history_reset_summary(
         "Automatische Zusammenfassung vor dem Zuruecksetzen beim Start:"
     )
     history_store.clear()
+    if is_missing_travian_key(TRAVIAN_PRIVATE_API_KEY):
+        logging.info("Travian API-Schluessel fehlt oder ist ein Platzhalter, fordere neuen Schluessel an.")
+        TRAVIAN_PRIVATE_API_KEY = request_and_store_travian_api_key()
+
     try:
         refreshed = refresh_map_snapshot(
             server_url=TRAVIAN_SERVER_URL,
@@ -292,7 +579,23 @@ def run_startup_maintenance() -> None:
             output_path=TRAVIAN_MAP_DATA_PATH,
         )
     except Exception:
-        logging.exception("Kartendaten konnten beim Start nicht aktualisiert werden.")
+        logging.exception(
+            "Kartendaten konnten beim Start nicht aktualisiert werden. "
+            "Versuche einen neuen Travian API-Schluessel anzufordern."
+        )
+        try:
+            TRAVIAN_PRIVATE_API_KEY = request_and_store_travian_api_key()
+            refreshed = refresh_map_snapshot(
+                server_url=TRAVIAN_SERVER_URL,
+                private_api_key=TRAVIAN_PRIVATE_API_KEY,
+                output_path=TRAVIAN_MAP_DATA_PATH,
+            )
+        except Exception:
+            logging.exception("Kartendaten konnten auch mit neuem Travian API-Schluessel nicht aktualisiert werden.")
+        else:
+            if refreshed:
+                invalidate_travian_map_cache()
+                logging.info("Travian map data refreshed during startup after renewing API key.")
     else:
         if refreshed:
             invalidate_travian_map_cache()
@@ -322,13 +625,54 @@ def run_daily_maintenance() -> None:
     logging.info("Daily maintenance finished.")
 
 
-def get_defender_name_hint(message: discord.Message) -> str:
+def get_defender_name_hint_from_user(user: discord.abc.User) -> str:
     parts = [
-        getattr(message.author, "display_name", None),
-        getattr(message.author, "global_name", None),
-        getattr(message.author, "name", None),
+        getattr(user, "display_name", None),
+        getattr(user, "global_name", None),
+        getattr(user, "name", None),
     ]
     return " | ".join(part for part in parts if part)
+
+
+def get_defender_name_hint(message: discord.Message) -> str:
+    return get_defender_name_hint_from_user(message.author)
+
+
+def is_watch_channel_id(channel_id: int | None) -> bool:
+    return channel_id is not None and channel_id in WATCH_CHANNEL_IDS
+
+
+def is_message_in_watch_channel(message: discord.Message) -> bool:
+    return message.guild is not None and is_watch_channel_id(message.channel.id)
+
+
+def is_interaction_in_watch_channel(interaction: discord.Interaction) -> bool:
+    return interaction.guild is not None and is_watch_channel_id(interaction.channel_id)
+
+
+async def reject_interaction_outside_watch_channels(
+    interaction: discord.Interaction,
+) -> None:
+    text = DM_REJECTION_TEXT if interaction.guild is None else WATCH_CHANNEL_REJECTION_TEXT
+    ephemeral = interaction.guild is not None
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(text, ephemeral=ephemeral)
+    except discord.HTTPException:
+        logging.warning("Konnte Watch-Channel-Ablehnung fuer Interaction nicht senden.")
+
+
+async def watch_channel_interaction_check(interaction: discord.Interaction) -> bool:
+    if is_interaction_in_watch_channel(interaction):
+        return True
+
+    await reject_interaction_outside_watch_channels(interaction)
+    return False
+
+
+bot.tree.interaction_check = watch_channel_interaction_check
 
 
 async def get_output_channel(
@@ -362,8 +706,7 @@ async def send_history_summary_chunks(chunks: list[str], fallback_channel: disco
 
 
 async def process_attack_message(message: discord.Message) -> None:
-    is_watched_channel = WATCH_ALL_CHANNELS or not WATCH_CHANNEL_IDS or message.channel.id in WATCH_CHANNEL_IDS
-    if not is_watched_channel or message.author.bot:
+    if not is_message_in_watch_channel(message) or message.author.bot or message.content.startswith(PREFIX):
         return
 
     try:
@@ -386,7 +729,6 @@ async def process_attack_message(message: discord.Message) -> None:
                     resolution.defender_village.name,
                 )
                 continue
-            history_store.add(build_history_entry(resolution, message.jump_url))
             rendered_messages.append((embed, resolution))
             logging.info(
                 "Attack processed: %s/%s -> %s/%s",
@@ -402,20 +744,32 @@ async def process_attack_message(message: discord.Message) -> None:
         )
     else:
         for embed, resolution in rendered_messages:
-            sent_message = await output_channel.send(embed=embed)
-            history_store.set_bot_message_url(
-                resolution.attacker_village.village_id,
-                resolution.defender_village.village_id,
-                sent_message.jump_url,
+            await send_attack_embed_and_track(
+                output_channel=output_channel,
+                embed=embed,
+                resolution=resolution,
+                source_message_url=message.jump_url,
             )
 
 
-def build_attack_body(message: discord.Message, message_content: str) -> tuple[str, object] | None:
+def build_attack_body_from_source(
+    *,
+    message_content: str,
+    noted_time: object,
+    defender_name_hint: str,
+    message_url: str | None,
+    defender_name_override: str | None = None,
+    defender_village_override: str | None = None,
+    noted_time_hint: str | None = None,
+) -> tuple[str, object] | None:
     resolution = resolve_attack_message(
         map_payload=get_travian_map_payload(),
         message_content=message_content,
-        noted_time=message.created_at.astimezone(),
-        defender_name_hint=get_defender_name_hint(message),
+        noted_time=noted_time,
+        defender_name_hint=defender_name_hint,
+        defender_name_override=defender_name_override,
+        defender_village_override=defender_village_override,
+        noted_time_hint=noted_time_hint,
     )
     if resolution is None:
         return None
@@ -432,6 +786,7 @@ def build_attack_body(message: discord.Message, message_content: str) -> tuple[s
     kata_guess = resolution.guesses.get("katapult")
     ram_previous = get_previous_tp_guess(ram_guess, resolution.arrival_time, resolution.noted_time)
     kata_previous = get_previous_tp_guess(kata_guess, resolution.arrival_time, resolution.noted_time)
+    alternative_guess = resolution.alternative_guess
     distance_line = (
         f"{translate(BOT_LOCALE, 'distance')}: "
         f"`{resolution.distance:.3f} {translate(BOT_LOCALE, 'fields')}`"
@@ -440,10 +795,11 @@ def build_attack_body(message: discord.Message, message_content: str) -> tuple[s
         distance_line += f" {translate(BOT_LOCALE, 'tp_irrelevant')}"
 
     if resolution.distance < 20:
-        short_speed = get_short_distance_speed(
-            resolution.distance,
-            resolution.noted_time,
-            resolution.arrival_time,
+        short_speed = get_short_distance_speed_with_world_limit(
+            map_payload=get_travian_map_payload(),
+            distance=resolution.distance,
+            noted_time=resolution.noted_time,
+            arrival_time=resolution.arrival_time,
         )
         if short_speed is None:
             speed_line = f"{translate(BOT_LOCALE, 'speed')}: -"
@@ -458,28 +814,43 @@ def build_attack_body(message: discord.Message, message_content: str) -> tuple[s
                 f"Start `{format_datetime_short(short_launch)}`"
             )
     else:
-        speed_line = (
-            f"{translate(BOT_LOCALE, 'ram')}: "
-            f"{format_guess(ram_guess, ram_previous, resolution.distance, BOT_LOCALE)}\n"
-            f"{translate(BOT_LOCALE, 'katapult')}: "
-            f"{format_guess(kata_guess, kata_previous, resolution.distance, BOT_LOCALE)}"
-        )
+        speed_lines = []
+        if is_recent_standard_guess(ram_guess):
+            speed_lines.append(
+                f"{translate(BOT_LOCALE, 'ram')}: "
+                f"{format_guess(ram_guess, ram_previous, resolution.distance, BOT_LOCALE)}"
+            )
+        if is_recent_standard_guess(kata_guess):
+            speed_lines.append(
+                f"{translate(BOT_LOCALE, 'katapult')}: "
+                f"{format_guess(kata_guess, kata_previous, resolution.distance, BOT_LOCALE)}"
+            )
+        if len(speed_lines) < 2 and alternative_guess is not None:
+            formatted_alternative = format_speed_guess(alternative_guess, BOT_LOCALE)
+            if formatted_alternative != "-":
+                speed_lines.append(
+                    f"{translate(BOT_LOCALE, 'speed')}: {formatted_alternative}"
+                )
+        speed_line = "\n".join(speed_lines) if speed_lines else f"{translate(BOT_LOCALE, 'speed')}: -"
 
-    body = "\n".join(
+    body_lines = [
+        translate(
+            BOT_LOCALE,
+            "from_to",
+            attacker=resolution.attacker.name,
+            attacker_link=attacker_player_link,
+            attacker_village=resolution.attacker_village.name,
+            attacker_village_link=attacker_village_link,
+            defender=resolution.defender.name,
+            defender_link=defender_player_link,
+            defender_village=defender_village_name,
+            defender_village_link=defender_village_link,
+        ),
+    ]
+    if message_url:
+        body_lines.append(f"{translate(BOT_LOCALE, 'message_link')}: {message_url}")
+    body_lines.extend(
         [
-            translate(
-                BOT_LOCALE,
-                "from_to",
-                attacker=resolution.attacker.name,
-                attacker_link=attacker_player_link,
-                attacker_village=resolution.attacker_village.name,
-                attacker_village_link=attacker_village_link,
-                defender=resolution.defender.name,
-                defender_link=defender_player_link,
-                defender_village=defender_village_name,
-                defender_village_link=defender_village_link,
-            ),
-            f"{translate(BOT_LOCALE, 'message_link')}: {message.jump_url}",
             f"{translate(BOT_LOCALE, 'noted_time')}: `{format_datetime_short(resolution.noted_time)}`",
             f"{translate(BOT_LOCALE, 'arrival_time')}: `{format_datetime_short(resolution.arrival_time)}`",
             f"{translate(BOT_LOCALE, 'remaining_time')}: `{format_duration_hms(resolution.noted_time, resolution.arrival_time)}`",
@@ -488,7 +859,16 @@ def build_attack_body(message: discord.Message, message_content: str) -> tuple[s
         ]
     )
 
-    return body, resolution
+    return "\n".join(body_lines), resolution
+
+
+def build_attack_body(message: discord.Message, message_content: str) -> tuple[str, object] | None:
+    return build_attack_body_from_source(
+        message_content=message_content,
+        noted_time=message.created_at.astimezone(),
+        defender_name_hint=get_defender_name_hint(message),
+        message_url=message.jump_url,
+    )
 
 
 def build_attack_embed(
@@ -512,34 +892,85 @@ def build_attack_embed(
     return embed, resolution
 
 
+def build_attack_embed_from_source(
+    *,
+    message_content: str,
+    noted_time: object,
+    defender_name_hint: str,
+    message_url: str | None,
+    defender_name_override: str | None = None,
+    defender_village_override: str | None = None,
+    noted_time_hint: str | None = None,
+) -> tuple[discord.Embed, object] | None:
+    rendered = build_attack_body_from_source(
+        message_content=message_content,
+        noted_time=noted_time,
+        defender_name_hint=defender_name_hint,
+        message_url=message_url,
+        defender_name_override=defender_name_override,
+        defender_village_override=defender_village_override,
+        noted_time_hint=noted_time_hint,
+    )
+    if rendered is None:
+        return None
+    body, resolution = rendered
+
+    embed = discord.Embed(
+        title=translate(
+            BOT_LOCALE,
+            "attack_siege" if resolution.parsed.is_siege else "attack_normal",
+        ),
+        color=discord.Color.orange() if resolution.parsed.is_siege else discord.Color.red(),
+    )
+    embed.description = body
+
+    return embed, resolution
+
+
 @bot.event
 async def on_ready() -> None:
     global _pending_history_summary
     logging.info("Logged in as %s (ID: %s)", bot.user, bot.user.id if bot.user else "n/a")
     if not nightly_maintenance.is_running():
         nightly_maintenance.start()
+    try:
+        synced = await bot.tree.sync()
+        logging.info("Synced %s global application commands.", len(synced))
+        for guild in bot.guilds:
+            bot.tree.copy_global_to(guild=guild)
+            guild_synced = await bot.tree.sync(guild=guild)
+            logging.info(
+                "Synced %s guild application commands for %s (%s).",
+                len(guild_synced),
+                guild.name,
+                guild.id,
+            )
+    except Exception:
+        logging.exception("Failed to sync application commands.")
     if _pending_history_summary:
         await send_history_summary_chunks(_pending_history_summary)
         _pending_history_summary = []
 
 
-@bot.command(name="hello")
+@bot.hybrid_command(name="hallo", aliases=["hello"], with_app_command=True)
 async def hello(ctx: commands.Context) -> None:
     await ctx.send(f"Hallo {ctx.author.mention}, ich bin online und einsatzbereit.")
 
 
-@bot.command(name="hallo")
-async def hallo(ctx: commands.Context) -> None:
-    await hello(ctx)
+@bot.tree.command(name="hello", description="Kurzer Funktionstest")
+async def slash_hello(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(
+        f"Hallo {interaction.user.mention}, ich bin online und einsatzbereit."
+    )
 
 
-@bot.command(name="ping")
+@bot.hybrid_command(name="ping", with_app_command=True)
 async def ping(ctx: commands.Context) -> None:
     latency_ms = round(bot.latency * 1000)
     await ctx.send(f"Pong! Aktuelle Latenz: `{latency_ms} ms`.")
 
 
-@bot.command(name="about")
+@bot.hybrid_command(name="info", aliases=["about"], with_app_command=True)
 async def about(ctx: commands.Context) -> None:
     await ctx.send(
         "\n".join(
@@ -552,9 +983,17 @@ async def about(ctx: commands.Context) -> None:
     )
 
 
-@bot.command(name="info")
-async def info(ctx: commands.Context) -> None:
-    await about(ctx)
+@bot.tree.command(name="about", description="Erklaert den Bot kurz")
+async def slash_about(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(
+        "\n".join(
+            [
+                "Ich werte Travian Kingdoms Angriffsmeldungen in beobachteten Kanaelen aus.",
+                "Dabei verlinke ich Spieler und Doerfer, berechne Restlaufzeiten und schaetze Startzeiten.",
+                f"Mit `/{'hilfe'}` oder `/help` bekommst du eine kurze Uebersicht.",
+            ]
+        )
+    )
 
 
 def build_channel_link(guild_id: int | None, channel_id: int) -> str:
@@ -563,7 +1002,7 @@ def build_channel_link(guild_id: int | None, channel_id: int) -> str:
     return f"https://discord.com/channels/{guild_id}/{channel_id}"
 
 
-@bot.command(name="channels")
+@bot.hybrid_command(name="kanaele", aliases=["channels"], with_app_command=True)
 async def channels(ctx: commands.Context) -> None:
     guild_id = ctx.guild.id if ctx.guild else None
     watch_links = [
@@ -574,36 +1013,48 @@ async def channels(ctx: commands.Context) -> None:
 
     lines = [
         "Aktuelle Kanal-Konfiguration:",
-        f"Watch-All-Channels: `{'true' if WATCH_ALL_CHANNELS else 'false'}`",
+        "Bot-Zugriff: `nur Watch-Kanaele`",
         f"Watch-Kanaele: {', '.join(watch_links) if watch_links else '-'}",
         f"Ausgabe-Kanal: {output_link}",
     ]
     await ctx.send("\n".join(lines))
 
 
-@bot.command(name="kanaele")
-async def kanaele(ctx: commands.Context) -> None:
-    await channels(ctx)
+@bot.tree.command(name="channels", description="Zeigt Watch- und Ausgabe-Kanaele")
+async def slash_channels(interaction: discord.Interaction) -> None:
+    guild_id = interaction.guild.id if interaction.guild else None
+    watch_links = [
+        build_channel_link(guild_id, channel_id)
+        for channel_id in sorted(WATCH_CHANNEL_IDS)
+    ]
+    output_link = build_channel_link(guild_id, OUTPUT_CHANNEL_ID) if OUTPUT_CHANNEL_ID else "-"
+    lines = [
+        "Aktuelle Kanal-Konfiguration:",
+        "Bot-Zugriff: `nur Watch-Kanaele`",
+        f"Watch-Kanaele: {', '.join(watch_links) if watch_links else '-'}",
+        f"Ausgabe-Kanal: {output_link}",
+    ]
+    await interaction.response.send_message("\n".join(lines))
 
 
-@bot.command(name="help")
+@bot.hybrid_command(name="hilfe", aliases=["help"], with_app_command=True)
 async def help_command(ctx: commands.Context) -> None:
     await ctx.send("\n".join(HELP_LINES))
 
 
-@bot.command(name="hilfe")
-async def hilfe(ctx: commands.Context) -> None:
-    await help_command(ctx)
+@bot.tree.command(name="help", description="Zeigt diese Hilfe an")
+async def slash_help(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message("\n".join(HELP_LINES))
 
 
-@bot.command(name="reset")
+@bot.hybrid_command(name="reset", with_app_command=True)
 async def reset_history(ctx: commands.Context) -> None:
     history_store.clear()
     logging.info("Attack history manually reset by %s.", ctx.author)
     await ctx.send("Die Angriffshistorie wurde geleert.")
 
 
-@bot.command(name="summary")
+@bot.hybrid_command(name="summary", with_app_command=True)
 async def summary(ctx: commands.Context) -> None:
     entries = history_store.list_entries()
     if not entries:
@@ -613,44 +1064,229 @@ async def summary(ctx: commands.Context) -> None:
         await ctx.send(chunk)
 
 
-@bot.command(name="updateTK")
+@bot.hybrid_command(
+    name="summarydorf",
+    aliases=["summaryziel", "summarydef", "summaryd"],
+    with_app_command=True,
+)
+async def summary_by_defender_village(ctx: commands.Context) -> None:
+    entries = history_store.list_entries()
+    if not entries:
+        await ctx.send("Die Angriffshistorie ist aktuell leer.")
+        return
+    for chunk in build_defender_village_summary_chunks(entries):
+        await ctx.send(chunk)
+
+
+@bot.hybrid_command(
+    name="angreiferliste",
+    aliases=["angreifer", "attackerliste", "attackers"],
+    with_app_command=True,
+)
+async def attacker_export(ctx: commands.Context) -> None:
+    entries = history_store.list_entries()
+    if not entries:
+        await ctx.send("Die Angriffshistorie ist aktuell leer.")
+        return
+    for chunk in build_history_village_tsv_chunks(
+        entries,
+        role="attacker",
+        map_payload=get_travian_map_payload(),
+    ):
+        await ctx.send(f"```tsv\n{chunk}\n```")
+
+
+@bot.hybrid_command(
+    name="verteidigerliste",
+    aliases=["verteidiger", "defenderliste", "defenders"],
+    with_app_command=True,
+)
+async def defender_export(ctx: commands.Context) -> None:
+    entries = history_store.list_entries()
+    if not entries:
+        await ctx.send("Die Angriffshistorie ist aktuell leer.")
+        return
+    for chunk in build_history_village_tsv_chunks(
+        entries,
+        role="defender",
+        map_payload=get_travian_map_payload(),
+    ):
+        await ctx.send(f"```tsv\n{chunk}\n```")
+
+
+@bot.hybrid_command(name="updatetk", aliases=["updateTK"], with_app_command=True)
 async def update_tk(ctx: commands.Context) -> None:
-    previous_payload = load_map_snapshot_from_disk()
-    previous_signature = snapshot_signature(previous_payload)
+    scope_id = get_context_scope_id(ctx)
+    cooldown_message = claim_update_tk_run(scope_id)
+    if cooldown_message is not None:
+        await ctx.send(cooldown_message)
+        return
 
     try:
-        refreshed = refresh_map_snapshot(
-            server_url=TRAVIAN_SERVER_URL,
-            private_api_key=TRAVIAN_PRIVATE_API_KEY,
-            output_path=TRAVIAN_MAP_DATA_PATH,
+        previous_payload = load_map_snapshot_from_disk()
+        previous_signature = snapshot_signature(previous_payload)
+
+        try:
+            refreshed = refresh_map_snapshot(
+                server_url=TRAVIAN_SERVER_URL,
+                private_api_key=TRAVIAN_PRIVATE_API_KEY,
+                output_path=TRAVIAN_MAP_DATA_PATH,
+            )
+        except Exception:
+            logging.exception("Manuelles Travian-Update fehlgeschlagen.")
+            await ctx.send("Das Travian-Update ist fehlgeschlagen.")
+            return
+
+        if not refreshed:
+            await ctx.send("Das Travian-Update wurde uebersprungen, weil kein API-Schluessel gesetzt ist.")
+            return
+
+        invalidate_travian_map_cache()
+        new_payload = get_travian_map_payload()
+        new_signature = snapshot_signature(new_payload)
+
+        if previous_signature == new_signature:
+            logging.info("Manual Travian update by %s completed without detected changes.", ctx.author)
+            await ctx.send("Die Travian-Kartendaten wurden aktualisiert, aber es wurden keine Aenderungen erkannt.")
+            return
+
+        logging.info("Manual Travian update by %s detected changes.", ctx.author)
+        await ctx.send(
+            "Die Travian-Kartendaten wurden aktualisiert.\n"
+            + summarize_snapshot_change(previous_payload, new_payload)
         )
-    except Exception:
-        logging.exception("Manuelles Travian-Update fehlgeschlagen.")
-        await ctx.send("Das Travian-Update ist fehlgeschlagen.")
-        return
+    finally:
+        release_update_tk_run(scope_id)
 
-    if not refreshed:
-        await ctx.send("Das Travian-Update wurde uebersprungen, weil kein API-Schluessel gesetzt ist.")
-        return
 
-    invalidate_travian_map_cache()
-    new_payload = get_travian_map_payload()
-    new_signature = snapshot_signature(new_payload)
-
-    if previous_signature == new_signature:
-        logging.info("Manual Travian update by %s completed without detected changes.", ctx.author)
-        await ctx.send("Die Travian-Kartendaten wurden aktualisiert, aber es wurden keine Aenderungen erkannt.")
-        return
-
-    logging.info("Manual Travian update by %s detected changes.", ctx.author)
+@bot.hybrid_command(name="meldeformat", with_app_command=True)
+async def meldeformat(ctx: commands.Context) -> None:
     await ctx.send(
-        "Die Travian-Kartendaten wurden aktualisiert.\n"
-        + summarize_snapshot_change(previous_payload, new_payload)
+        "\n".join(
+            [
+                "Empfohlenes Format fuer manuelle Meldungen:",
+                "```text",
+                "auf <spieler>",
+                "<dorf>",
+                "<angriffszeile>",
+                "```",
+                "Beispiel:",
+                "```text",
+                "auf Weissvonnix",
+                "03",
+                "Angriff von cuisto aus thtef in 10:35:38 um 08:00:54",
+                "```",
+                "`auf <spieler>` fehlt: Discord-Name wird verwendet.",
+                "`<dorf>` fehlt: Hauptdorf (`HD`) wird verwendet.",
+                "`seit <zeit>` kann optional vorher oder nachher dazugefuegt werden als erste sichtbare Zeit und wird dann statt der aktuellen Zeit verwendet.",
+                "Auch `1/2`, `1|2` oder `(1/2)` gehen anstatt Spieler und Dorf.",
+                "Mehrere Angriffszeilen in einer Nachricht sind moeglich. Nachtraegliches Ergaenzen per Bearbeiten geht auch.",
+                "Bitte moeglichst frueh melden. Schreibfehler bei Spieler- und Dorfnamen werden bestmoeglich korrigiert.",
+            ]
+        )
     )
+
+
+@app_commands.describe(
+    attack_string="Die Angriffszeile oder mehrere Angriffszeilen",
+    attacked_village="Optionales Zieldorf. Leer = Hauptdorf des passenden Discord-Spielers",
+    attacked_player="Optionaler Zielspieler. Leer = passender Discord-Spielername",
+    seit="Optional: seit wann der Angriff sichtbar ist, z. B. 20:34 oder 2026-04-30 20:34",
+)
+@bot.tree.command(name="melden", description="Meldet einen Angriff strukturiert")
+async def slash_melden(
+    interaction: discord.Interaction,
+    attack_string: str,
+    attacked_village: str | None = None,
+    attacked_player: str | None = None,
+    seit: str | None = None,
+) -> None:
+    reference_time = discord.utils.utcnow().astimezone()
+    if seit and parse_flexible_noted_time(reference_time, seit) is None:
+        await interaction.response.send_message(
+            "`seit` konnte ich nicht lesen. Beispiele: `20:34`, `20:34:12`, `2026-04-30 20:34`.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.channel is not None:
+        output_channel = await get_output_channel(interaction.channel)
+    elif OUTPUT_CHANNEL_ID:
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if output_channel is None:
+            output_channel = await bot.fetch_channel(OUTPUT_CHANNEL_ID)
+    else:
+        await interaction.response.send_message(
+            "Ich habe gerade keinen erreichbaren Ausgabekanal fuer diese Meldung.",
+            ephemeral=True,
+        )
+        return
+
+    defender_name_hint = get_defender_name_hint_from_user(interaction.user)
+    defender_name_override = attacked_player.strip() if attacked_player and attacked_player.strip() else None
+    defender_village_override = attacked_village.strip() if attacked_village and attacked_village.strip() else None
+
+    rendered_messages: list[tuple[discord.Embed, object]] = []
+    parsed_count = 0
+    duplicate_count = 0
+    for part in split_attack_messages(attack_string):
+        rendered = build_attack_embed_from_source(
+            message_content=part,
+            noted_time=reference_time,
+            defender_name_hint=defender_name_hint,
+            message_url=None,
+            defender_name_override=defender_name_override,
+            defender_village_override=defender_village_override,
+            noted_time_hint=seit,
+        )
+        if rendered is None:
+            continue
+        parsed_count += 1
+        embed, resolution = rendered
+        if history_store.contains(
+            resolution.attacker_village.village_id,
+            resolution.defender_village.village_id,
+        ):
+            duplicate_count += 1
+            continue
+        rendered_messages.append((embed, resolution))
+
+    if parsed_count == 0:
+        await interaction.response.send_message(
+            "Ich konnte aus `attack_string` keine gueltige Angriffsmeldung lesen.",
+            ephemeral=True,
+        )
+        return
+
+    for embed, resolution in rendered_messages:
+        await send_attack_embed_and_track(
+            output_channel=output_channel,
+            embed=embed,
+            resolution=resolution,
+            source_message_url="",
+        )
+
+    if rendered_messages:
+        response_text = f"{len(rendered_messages)} Angriff(e) gemeldet."
+        if duplicate_count:
+            response_text += f" {duplicate_count} bekannte Dublette(n) wurden ignoriert."
+    else:
+        response_text = "Alle erkannten Angriffe waren bereits bekannt."
+    await interaction.response.send_message(response_text, ephemeral=True)
 
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
+    if message.author.bot:
+        return
+
+    if message.guild is None:
+        await message.channel.send(DM_REJECTION_TEXT)
+        return
+
+    if not is_message_in_watch_channel(message):
+        return
+
     await process_attack_message(message)
     await bot.process_commands(message)
 
