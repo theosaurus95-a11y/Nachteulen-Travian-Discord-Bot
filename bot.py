@@ -3,6 +3,7 @@ from logging.handlers import RotatingFileHandler
 import os
 import json
 import time
+import re
 from pathlib import Path
 from collections import Counter, defaultdict
 
@@ -99,6 +100,7 @@ WATCH_CHANNEL_IDS = {
     if channel_id.strip()
 }
 
+DISCORD_USER_MENTION_PATTERN = re.compile(r"<@!?(?P<user_id>\d+)>")
 DM_REJECTION_TEXT = (
     "Ich nehme keine Direktnachrichten an. "
     "Bitte nutze einen konfigurierten Watch-Kanal auf dem Discord-Server."
@@ -638,6 +640,59 @@ def get_defender_name_hint(message: discord.Message) -> str:
     return get_defender_name_hint_from_user(message.author)
 
 
+def replace_user_mentions_with_name_hints(
+    content: str,
+    users_by_id: dict[int, discord.abc.User],
+) -> str:
+    def replace_match(match: re.Match[str]) -> str:
+        user_id = int(match.group("user_id"))
+        user = users_by_id.get(user_id)
+        if user is None:
+            return match.group(0)
+        return get_defender_name_hint_from_user(user)
+
+    return DISCORD_USER_MENTION_PATTERN.sub(replace_match, content)
+
+
+def resolve_message_user_mentions(content: str, message: discord.Message) -> str:
+    users_by_id = {user.id: user for user in message.mentions}
+    if not users_by_id:
+        return content
+    return replace_user_mentions_with_name_hints(content, users_by_id)
+
+
+async def resolve_interaction_user_mentions(
+    content: str,
+    interaction: discord.Interaction,
+) -> str:
+    mention_ids = {
+        int(match.group("user_id"))
+        for match in DISCORD_USER_MENTION_PATTERN.finditer(content)
+    }
+    if not mention_ids:
+        return content
+
+    users_by_id: dict[int, discord.abc.User] = {}
+    for user_id in mention_ids:
+        if interaction.guild is not None:
+            member = interaction.guild.get_member(user_id)
+            if member is not None:
+                users_by_id[user_id] = member
+                continue
+
+        user = bot.get_user(user_id)
+        if user is not None:
+            users_by_id[user_id] = user
+            continue
+
+        try:
+            users_by_id[user_id] = await bot.fetch_user(user_id)
+        except discord.HTTPException:
+            logging.info("Discord mention konnte nicht aufgeloest werden: %s", user_id)
+
+    return replace_user_mentions_with_name_hints(content, users_by_id)
+
+
 def is_watch_channel_id(channel_id: int | None) -> bool:
     return channel_id is not None and channel_id in WATCH_CHANNEL_IDS
 
@@ -864,7 +919,7 @@ def build_attack_body_from_source(
 
 def build_attack_body(message: discord.Message, message_content: str) -> tuple[str, object] | None:
     return build_attack_body_from_source(
-        message_content=message_content,
+        message_content=resolve_message_user_mentions(message_content, message),
         noted_time=message.created_at.astimezone(),
         defender_name_hint=get_defender_name_hint(message),
         message_url=message.jump_url,
@@ -1222,14 +1277,23 @@ async def slash_melden(
         )
         return
 
+    resolved_attack_string = await resolve_interaction_user_mentions(
+        attack_string,
+        interaction,
+    )
+    resolved_attacked_player = (
+        await resolve_interaction_user_mentions(attacked_player, interaction)
+        if attacked_player
+        else None
+    )
     defender_name_hint = get_defender_name_hint_from_user(interaction.user)
-    defender_name_override = attacked_player.strip() if attacked_player and attacked_player.strip() else None
+    defender_name_override = resolved_attacked_player.strip() if resolved_attacked_player and resolved_attacked_player.strip() else None
     defender_village_override = attacked_village.strip() if attacked_village and attacked_village.strip() else None
 
     rendered_messages: list[tuple[discord.Embed, object]] = []
     parsed_count = 0
     duplicate_count = 0
-    for part in split_attack_messages(attack_string):
+    for part in split_attack_messages(resolved_attack_string):
         rendered = build_attack_embed_from_source(
             message_content=part,
             noted_time=reference_time,

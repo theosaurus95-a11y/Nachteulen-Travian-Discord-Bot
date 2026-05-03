@@ -12,6 +12,7 @@ from travian_kingdoms_api import (
     TravelGuess,
     Village,
     build_travel_guess,
+    build_village,
     get_main_village_of_player,
     get_most_similar_player_name,
     get_most_similar_village_of_player,
@@ -37,6 +38,9 @@ ATTACK_PATTERN = re.compile(
 )
 SINCE_LINE_PATTERN = re.compile(r"(?i)^\s*seit\s+(?P<value>.+?)\s*$")
 TIME_ONLY_PATTERN = re.compile(r"^\s*(?P<hour>\d{1,2}):(?P<minute>\d{2})(?::(?P<second>\d{2}))?\s*$")
+COORDINATE_PATTERN = re.compile(
+    r"(?<!\d)\(?\s*(?P<x>-?\d{1,3})\s*(?:/|\|)\s*(?P<y>-?\d{1,3})\s*\)?(?!\d)"
+)
 MAX_STANDARD_GUESS_AGE_SECONDS = 60 * 60
 
 @dataclass(frozen=True)
@@ -44,6 +48,7 @@ class ParsedAttackMessage:
     raw_text: str
     defender_name_hint: str | None
     defender_village_hint: str | None
+    defender_coordinates_hint: tuple[int, int] | None
     use_message_author_for_defender: bool
     visible_since_text: str | None
     attacker_hint: str
@@ -102,6 +107,62 @@ def load_map_payload(path: str = "travian-map-data.json") -> dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _extract_coordinates(value: str | None) -> tuple[int, int] | None:
+    if not value:
+        return None
+    match = COORDINATE_PATTERN.search(value)
+    if match is None:
+        return None
+    return int(match.group("x")), int(match.group("y"))
+
+
+def _strip_coordinates(value: str) -> str:
+    return _clean_segment(COORDINATE_PATTERN.sub(" ", value).strip())
+
+
+def _strip_optional_coordinates(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = _strip_coordinates(value)
+    return stripped or None
+
+
+def _extract_leading_defender_hint(content: str) -> tuple[str | None, str] | None:
+    match = ATTACK_PATTERN.search(content)
+    if match is None or match.start() == 0:
+        return None
+
+    lines = [
+        line.strip().rstrip(":")
+        for line in content[: match.start()].splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return None
+
+    return _strip_optional_coordinates(lines[-1]), content[match.start() :].strip()
+
+
+def _extract_defender_coordinates(
+    content: str,
+    *hints: str | None,
+) -> tuple[int, int] | None:
+    for hint in hints:
+        coordinates = _extract_coordinates(hint)
+        if coordinates is not None:
+            return coordinates
+
+    match = ATTACK_PATTERN.search(content)
+    if match is None:
+        return _extract_coordinates(content)
+
+    for segment in (content[: match.start()], content[match.end() :]):
+        coordinates = _extract_coordinates(segment)
+        if coordinates is not None:
+            return coordinates
+    return None
+
+
 def parse_attack_message(content: str) -> ParsedAttackMessage | None:
     compact = content.strip()
     if not compact:
@@ -115,29 +176,36 @@ def parse_attack_message(content: str) -> ParsedAttackMessage | None:
         defender_name_hint, defender_village_hint, compact, use_message_author_for_defender = override
 
     visible_since_text, compact = _extract_visible_since_hint(compact)
+    coordinate_source = compact
 
     prefix_match = re.match(r"(?s)^\s*([^:\n]{1,80})\s*:\s*(.+)$", compact)
     if prefix_match:
         possible_hint = prefix_match.group(1).strip()
         remaining = prefix_match.group(2).strip()
         if ATTACK_PATTERN.search(remaining):
-            defender_village_hint = possible_hint
+            defender_village_hint = _strip_coordinates(possible_hint)
             compact = remaining
     else:
-        lines = [line.strip() for line in compact.splitlines() if line.strip()]
-        if len(lines) >= 2 and ATTACK_PATTERN.search(lines[0]) is None and ATTACK_PATTERN.search(lines[1]):
-            defender_village_hint = lines[0]
-            compact = "\n".join(lines[1:])
+        prefixed_hint = _extract_leading_defender_hint(compact)
+        if prefixed_hint is not None:
+            defender_village_hint, compact = prefixed_hint
 
     match = ATTACK_PATTERN.search(compact)
     if not match:
         return None
 
+    defender_coordinates_hint = _extract_defender_coordinates(
+        coordinate_source,
+        defender_village_hint,
+    )
+    defender_name_hint = _strip_optional_coordinates(defender_name_hint)
+    defender_village_hint = _strip_optional_coordinates(defender_village_hint)
     lowered = compact.casefold()
     return ParsedAttackMessage(
         raw_text=content,
         defender_name_hint=defender_name_hint,
         defender_village_hint=defender_village_hint,
+        defender_coordinates_hint=defender_coordinates_hint,
         use_message_author_for_defender=use_message_author_for_defender,
         visible_since_text=visible_since_text,
         attacker_hint=_clean_segment(match.group("attacker")),
@@ -185,22 +253,44 @@ def resolve_attack_message(
         noted_time,
         noted_time_hint or parsed.visible_since_text,
     ) or noted_time
-    effective_defender_hint = (
-        defender_name_override
-        or (
-            defender_name_hint
-            if parsed.use_message_author_for_defender
-            else (parsed.defender_name_hint or defender_name_hint)
-        )
+    defender_coordinates = (
+        _extract_coordinates(defender_village_override)
+        or parsed.defender_coordinates_hint
     )
-    defender_name = get_most_similar_player_name(map_payload, effective_defender_hint)
     attacker_name = get_most_similar_player_name(map_payload, parsed.attacker_hint)
 
-    defender_village, used_main_village = _resolve_defender_village(
-        map_payload=map_payload,
-        defender_name=defender_name,
-        defender_village_hint=defender_village_override or parsed.defender_village_hint,
-    )
+    if defender_coordinates is not None:
+        defender_match = _find_village_match_by_coordinates(
+            map_payload,
+            defender_coordinates[0],
+            defender_coordinates[1],
+        )
+        if defender_match is None:
+            raise ValueError(
+                "No village found at coordinates: "
+                f"{defender_coordinates[0]}/{defender_coordinates[1]}"
+            )
+        defender = defender_match[0]
+        defender_name = defender.name
+        defender_village = defender_match[1]
+        used_main_village = False
+    else:
+        effective_defender_hint = (
+            defender_name_override
+            or (
+                defender_name_hint
+                if parsed.use_message_author_for_defender
+                else (parsed.defender_name_hint or defender_name_hint)
+            )
+        )
+        defender_name = get_most_similar_player_name(map_payload, effective_defender_hint)
+        defender = _find_player_match(map_payload, defender_name)
+        defender_village, used_main_village = _resolve_defender_village(
+            map_payload=map_payload,
+            defender_name=defender_name,
+            defender_village_hint=defender_village_override or parsed.defender_village_hint,
+        )
+
     attacker_village = get_most_similar_village_of_player(
         map_payload,
         attacker_name,
@@ -235,7 +325,7 @@ def resolve_attack_message(
         noted_time=effective_noted_time,
         arrival_time=arrival_time,
         attacker=_find_player_match(map_payload, attacker_name),
-        defender=_find_player_match(map_payload, defender_name),
+        defender=defender,
         attacker_village=attacker_village,
         defender_village=defender_village,
         distance=village_distance(attacker_village, defender_village),
@@ -357,11 +447,24 @@ def _extract_defender_override(content: str) -> tuple[str, str, str, bool] | Non
     remainder_lines = lines[1:]
 
     if remainder_lines:
-        second_line = remainder_lines[0].strip()
+        first_content_index = next(
+            (index for index, line in enumerate(remainder_lines) if line.strip()),
+            None,
+        )
+        if first_content_index is None:
+            return None
+
+        second_line = remainder_lines[first_content_index].strip()
+        if ATTACK_PATTERN.search(second_line):
+            defender = _clean_segment(after_auf)
+            remaining = "\n".join(remainder_lines[first_content_index:]).strip()
+            if defender and remaining:
+                return defender, "", remaining, _is_self_reference(defender)
+
         if second_line and ATTACK_PATTERN.search(second_line) is None:
             defender = _clean_segment(after_auf)
             village = _clean_segment(second_line.rstrip(":"))
-            remaining = "\n".join(remainder_lines[1:]).strip()
+            remaining = "\n".join(remainder_lines[first_content_index + 1 :]).strip()
             if defender and village and remaining:
                 return defender, village, remaining, _is_self_reference(defender)
 
@@ -471,6 +574,23 @@ def _find_player_match(map_payload: dict[str, Any], player_name: str) -> PlayerM
                 player_id=str(player.get("playerId", "")),
             )
     raise ValueError(f"Player not found: {player_name}")
+
+
+def _find_village_match_by_coordinates(
+    map_payload: dict[str, Any],
+    x: int,
+    y: int,
+) -> tuple[PlayerMatch, Village] | None:
+    for player in players_data(map_payload):
+        player_match = PlayerMatch(
+            name=str(player.get("name", "")),
+            player_id=str(player.get("playerId", "")),
+        )
+        for village_data in player.get("villages", []):
+            village = build_village(village_data)
+            if village.x == x and village.y == y:
+                return player_match, village
+    return None
 
 
 def _resolve_arrival_time(noted_time: datetime, arrival_text: str) -> datetime:
