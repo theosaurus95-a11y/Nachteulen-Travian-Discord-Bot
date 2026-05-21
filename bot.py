@@ -3,7 +3,6 @@ from logging.handlers import RotatingFileHandler
 import os
 import json
 import time
-import re
 from pathlib import Path
 from collections import Counter, defaultdict
 
@@ -19,8 +18,10 @@ from bot_runtime import (
 )
 
 from travian_discord_integration import (
+    AttackParseError,
     build_player_link,
     build_village_link,
+    explain_attack_parse_failure,
     format_guess,
     format_datetime_short,
     format_duration_hms,
@@ -69,6 +70,7 @@ logging.basicConfig(
 TOKEN = os.getenv("DISCORD_TOKEN")
 PREFIX = os.getenv("COMMAND_PREFIX", "!")
 raw_channel_ids = os.getenv("WATCH_CHANNEL_IDS", "")
+raw_command_only_channel_ids = os.getenv("WATCH_CHANNEL_IDS_ONLY_COMMANDS", "")
 TRAVIAN_SERVER_URL = os.getenv("TRAVIAN_SERVER_URL", "").strip()
 TRAVIAN_MAP_DATA_PATH = os.getenv("TRAVIAN_MAP_DATA_PATH", "travian-map-data.json")
 TRAVIAN_PRIVATE_API_KEY = os.getenv("TRAVIAN_PRIVATE_API_KEY", "").strip() or None
@@ -94,18 +96,95 @@ if not TRAVIAN_SERVER_URL:
         "TRAVIAN_SERVER_URL is missing. Add it to your environment or .env file."
     )
 
-WATCH_CHANNEL_IDS = {
-    int(channel_id.strip())
-    for channel_id in raw_channel_ids.split(",")
-    if channel_id.strip()
-}
+def parse_channel_ids(raw_value: str) -> set[int]:
+    return {
+        int(channel_id.strip())
+        for channel_id in raw_value.split(",")
+        if channel_id.strip()
+    }
 
-DISCORD_USER_MENTION_PATTERN = re.compile(r"<@!?(?P<user_id>\d+)>")
+
+WATCH_CHANNEL_IDS = parse_channel_ids(raw_channel_ids)
+WATCH_CHANNEL_IDS_ONLY_COMMANDS = parse_channel_ids(raw_command_only_channel_ids)
+
 DM_REJECTION_TEXT = (
     "Ich nehme keine Direktnachrichten an. "
     "Bitte nutze einen konfigurierten Watch-Kanal auf dem Discord-Server."
 )
-WATCH_CHANNEL_REJECTION_TEXT = "Ich reagiere nur in den konfigurierten Watch-Kanaelen."
+WATCH_CHANNEL_REJECTION_TEXT = "Ich reagiere nur in den konfigurierten Bot-Kanaelen."
+
+
+def build_meldeformat_text(
+    *,
+    include_edit_hint: bool = False,
+    message_url: str | None = None,
+    error_message: str | None = None,
+) -> str:
+    lines = []
+    if include_edit_hint:
+        lines.extend(
+            [
+                "Ich konnte deine Angriffsmeldung nicht lesen. Bitte bessere deine Nachricht über bearbeiten nach.",
+                "",
+            ]
+        )
+    if message_url:
+        lines.extend(
+            [
+                f"Nachricht: {message_url}",
+            ]
+        )
+    if error_message:
+        lines.extend(
+            [
+                f"Fehler: {error_message}",
+            ]
+        )
+    if message_url or error_message:
+        lines.append("")
+
+    lines.extend(
+        [
+            "Das Format für Angriffsmeldungen:",
+            "```text",
+            "<Dorfkoordinaten>",
+            "<Angriffszeile>",
+            "<Optionale weitere Angriffszeilen>",
+            "```",
+            "Beispiel:",
+            "```text",
+            "-15/7",
+            "",
+            "Belagerung von Leo aus Barnaba",
+            "in 22:10:46 um 11:59:01",
+            " Belagerung von Jon Aegon aus 1.Winterfel",
+            "in 22:10:46 um 11:59:01",
+            "```",
+            "Koordinaten können auch mit `|` oder Leerzeichen getrennt sein, oder Kartenlinks sein.",
+            "Das vorherige Meldeformat mit Dorfname statt Dorfkoordinaten wird auch weiterhin unterstützt, ist aber fehleranfälliger.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+async def send_meldeformat_dm(
+    user: discord.User | discord.Member,
+    *,
+    message_url: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    try:
+        await user.send(
+            build_meldeformat_text(
+                include_edit_hint=True,
+                message_url=message_url,
+                error_message=error_message,
+            )
+        )
+    except discord.Forbidden:
+        logging.info("Konnte Meldeformat-DM nicht senden: DMs fuer %s geschlossen.", user)
+    except discord.HTTPException:
+        logging.exception("Konnte Meldeformat-DM an %s nicht senden.", user)
 
 
 def configure_file_logging() -> None:
@@ -627,82 +706,28 @@ def run_daily_maintenance() -> None:
     logging.info("Daily maintenance finished.")
 
 
-def get_defender_name_hint_from_user(user: discord.abc.User) -> str:
-    parts = [
-        getattr(user, "display_name", None),
-        getattr(user, "global_name", None),
-        getattr(user, "name", None),
-    ]
-    return " | ".join(part for part in parts if part)
-
-
-def get_defender_name_hint(message: discord.Message) -> str:
-    return get_defender_name_hint_from_user(message.author)
-
-
-def replace_user_mentions_with_name_hints(
-    content: str,
-    users_by_id: dict[int, discord.abc.User],
-) -> str:
-    def replace_match(match: re.Match[str]) -> str:
-        user_id = int(match.group("user_id"))
-        user = users_by_id.get(user_id)
-        if user is None:
-            return match.group(0)
-        return get_defender_name_hint_from_user(user)
-
-    return DISCORD_USER_MENTION_PATTERN.sub(replace_match, content)
-
-
-def resolve_message_user_mentions(content: str, message: discord.Message) -> str:
-    users_by_id = {user.id: user for user in message.mentions}
-    if not users_by_id:
-        return content
-    return replace_user_mentions_with_name_hints(content, users_by_id)
-
-
-async def resolve_interaction_user_mentions(
-    content: str,
-    interaction: discord.Interaction,
-) -> str:
-    mention_ids = {
-        int(match.group("user_id"))
-        for match in DISCORD_USER_MENTION_PATTERN.finditer(content)
-    }
-    if not mention_ids:
-        return content
-
-    users_by_id: dict[int, discord.abc.User] = {}
-    for user_id in mention_ids:
-        if interaction.guild is not None:
-            member = interaction.guild.get_member(user_id)
-            if member is not None:
-                users_by_id[user_id] = member
-                continue
-
-        user = bot.get_user(user_id)
-        if user is not None:
-            users_by_id[user_id] = user
-            continue
-
-        try:
-            users_by_id[user_id] = await bot.fetch_user(user_id)
-        except discord.HTTPException:
-            logging.info("Discord mention konnte nicht aufgeloest werden: %s", user_id)
-
-    return replace_user_mentions_with_name_hints(content, users_by_id)
-
-
 def is_watch_channel_id(channel_id: int | None) -> bool:
     return channel_id is not None and channel_id in WATCH_CHANNEL_IDS
+
+
+def is_command_channel_id(channel_id: int | None) -> bool:
+    return channel_id is not None and channel_id in WATCH_CHANNEL_IDS_ONLY_COMMANDS
+
+
+def is_bot_channel_id(channel_id: int | None) -> bool:
+    return is_watch_channel_id(channel_id) or is_command_channel_id(channel_id)
 
 
 def is_message_in_watch_channel(message: discord.Message) -> bool:
     return message.guild is not None and is_watch_channel_id(message.channel.id)
 
 
-def is_interaction_in_watch_channel(interaction: discord.Interaction) -> bool:
-    return interaction.guild is not None and is_watch_channel_id(interaction.channel_id)
+def is_message_in_bot_channel(message: discord.Message) -> bool:
+    return message.guild is not None and is_bot_channel_id(message.channel.id)
+
+
+def is_interaction_in_bot_channel(interaction: discord.Interaction) -> bool:
+    return interaction.guild is not None and is_bot_channel_id(interaction.channel_id)
 
 
 async def reject_interaction_outside_watch_channels(
@@ -720,7 +745,7 @@ async def reject_interaction_outside_watch_channels(
 
 
 async def watch_channel_interaction_check(interaction: discord.Interaction) -> bool:
-    if is_interaction_in_watch_channel(interaction):
+    if is_interaction_in_bot_channel(interaction):
         return True
 
     await reject_interaction_outside_watch_channels(interaction)
@@ -767,10 +792,21 @@ async def process_attack_message(message: discord.Message) -> None:
     try:
         output_channel = await get_output_channel(message.channel)
         rendered_messages: list[tuple[discord.Embed, object]] = []
-        for part in split_attack_messages(message.content):
+        message_parts = split_attack_messages(message.content)
+        if not message_parts:
+            await send_meldeformat_dm(
+                message.author,
+                message_url=message.jump_url,
+                error_message=explain_attack_parse_failure(message.content),
+            )
+            return
+
+        resolved_count = 0
+        for part in message_parts:
             rendered = build_attack_embed(message, part)
             if rendered is None:
-                continue
+                raise AttackParseError(explain_attack_parse_failure(part))
+            resolved_count += 1
             embed, resolution = rendered
             if history_store.contains(
                 resolution.attacker_village.village_id,
@@ -792,10 +828,33 @@ async def process_attack_message(message: discord.Message) -> None:
                 resolution.defender.name,
                 resolution.defender_village.name,
             )
+        if resolved_count == 0:
+            await send_meldeformat_dm(
+                message.author,
+                message_url=message.jump_url,
+                error_message="Alle erkannten Angriffe waren bereits bekannt.",
+            )
+            return
+    except AttackParseError as exc:
+        logging.info("Attack message could not be parsed: %s", exc.user_message)
+        await send_meldeformat_dm(
+            message.author,
+            message_url=message.jump_url,
+            error_message=exc.user_message,
+        )
+    except ValueError as exc:
+        logging.info("Attack message could not be resolved: %s", exc)
+        await send_meldeformat_dm(
+            message.author,
+            message_url=message.jump_url,
+            error_message=f"Die Angriffsmeldung konnte nicht mit den Kartendaten abgeglichen werden: {exc}",
+        )
     except Exception:
         logging.exception("Failed to resolve attack message.")
-        await message.channel.send(
-            "Ich konnte diese Angriffsmeldung nicht sauber mit den Travian-Daten abgleichen."
+        await send_meldeformat_dm(
+            message.author,
+            message_url=message.jump_url,
+            error_message="Beim Lesen der Angriffsmeldung ist ein unerwarteter Fehler passiert.",
         )
     else:
         for embed, resolution in rendered_messages:
@@ -811,19 +870,13 @@ def build_attack_body_from_source(
     *,
     message_content: str,
     noted_time: object,
-    defender_name_hint: str,
     message_url: str | None,
-    defender_name_override: str | None = None,
-    defender_village_override: str | None = None,
     noted_time_hint: str | None = None,
 ) -> tuple[str, object] | None:
     resolution = resolve_attack_message(
         map_payload=get_travian_map_payload(),
         message_content=message_content,
         noted_time=noted_time,
-        defender_name_hint=defender_name_hint,
-        defender_name_override=defender_name_override,
-        defender_village_override=defender_village_override,
         noted_time_hint=noted_time_hint,
     )
     if resolution is None:
@@ -834,8 +887,6 @@ def build_attack_body_from_source(
     attacker_village_link = build_village_link(TRAVIAN_SERVER_URL, resolution.attacker_village)
     defender_village_link = build_village_link(TRAVIAN_SERVER_URL, resolution.defender_village)
     defender_village_name = resolution.defender_village.name
-    if resolution.defender_used_main_village:
-        defender_village_name += " (HD)"
 
     ram_guess = resolution.guesses.get("ram")
     kata_guess = resolution.guesses.get("katapult")
@@ -919,9 +970,8 @@ def build_attack_body_from_source(
 
 def build_attack_body(message: discord.Message, message_content: str) -> tuple[str, object] | None:
     return build_attack_body_from_source(
-        message_content=resolve_message_user_mentions(message_content, message),
+        message_content=message_content,
         noted_time=message.created_at.astimezone(),
-        defender_name_hint=get_defender_name_hint(message),
         message_url=message.jump_url,
     )
 
@@ -951,19 +1001,13 @@ def build_attack_embed_from_source(
     *,
     message_content: str,
     noted_time: object,
-    defender_name_hint: str,
     message_url: str | None,
-    defender_name_override: str | None = None,
-    defender_village_override: str | None = None,
     noted_time_hint: str | None = None,
 ) -> tuple[discord.Embed, object] | None:
     rendered = build_attack_body_from_source(
         message_content=message_content,
         noted_time=noted_time,
-        defender_name_hint=defender_name_hint,
         message_url=message_url,
-        defender_name_override=defender_name_override,
-        defender_village_override=defender_village_override,
         noted_time_hint=noted_time_hint,
     )
     if rendered is None:
@@ -1064,12 +1108,17 @@ async def channels(ctx: commands.Context) -> None:
         build_channel_link(guild_id, channel_id)
         for channel_id in sorted(WATCH_CHANNEL_IDS)
     ]
+    command_only_links = [
+        build_channel_link(guild_id, channel_id)
+        for channel_id in sorted(WATCH_CHANNEL_IDS_ONLY_COMMANDS)
+    ]
     output_link = build_channel_link(guild_id, OUTPUT_CHANNEL_ID) if OUTPUT_CHANNEL_ID else "-"
 
     lines = [
         "Aktuelle Kanal-Konfiguration:",
-        "Bot-Zugriff: `nur Watch-Kanaele`",
-        f"Watch-Kanaele: {', '.join(watch_links) if watch_links else '-'}",
+        "Bot-Zugriff: `nur konfigurierte Bot-Kanaele`",
+        f"Watch-Kanaele fuer Meldungen: {', '.join(watch_links) if watch_links else '-'}",
+        f"Nur-Befehle-Kanaele: {', '.join(command_only_links) if command_only_links else '-'}",
         f"Ausgabe-Kanal: {output_link}",
     ]
     await ctx.send("\n".join(lines))
@@ -1082,11 +1131,16 @@ async def slash_channels(interaction: discord.Interaction) -> None:
         build_channel_link(guild_id, channel_id)
         for channel_id in sorted(WATCH_CHANNEL_IDS)
     ]
+    command_only_links = [
+        build_channel_link(guild_id, channel_id)
+        for channel_id in sorted(WATCH_CHANNEL_IDS_ONLY_COMMANDS)
+    ]
     output_link = build_channel_link(guild_id, OUTPUT_CHANNEL_ID) if OUTPUT_CHANNEL_ID else "-"
     lines = [
         "Aktuelle Kanal-Konfiguration:",
-        "Bot-Zugriff: `nur Watch-Kanaele`",
-        f"Watch-Kanaele: {', '.join(watch_links) if watch_links else '-'}",
+        "Bot-Zugriff: `nur konfigurierte Bot-Kanaele`",
+        f"Watch-Kanaele fuer Meldungen: {', '.join(watch_links) if watch_links else '-'}",
+        f"Nur-Befehle-Kanaele: {', '.join(command_only_links) if command_only_links else '-'}",
         f"Ausgabe-Kanal: {output_link}",
     ]
     await interaction.response.send_message("\n".join(lines))
@@ -1216,44 +1270,17 @@ async def update_tk(ctx: commands.Context) -> None:
 
 @bot.hybrid_command(name="meldeformat", with_app_command=True)
 async def meldeformat(ctx: commands.Context) -> None:
-    await ctx.send(
-        "\n".join(
-            [
-                "Empfohlenes Format fuer manuelle Meldungen:",
-                "```text",
-                "auf <spieler>",
-                "<dorf>",
-                "<angriffszeile>",
-                "```",
-                "Beispiel:",
-                "```text",
-                "auf Weissvonnix",
-                "03",
-                "Angriff von cuisto aus thtef in 10:35:38 um 08:00:54",
-                "```",
-                "`auf <spieler>` fehlt: Discord-Name wird verwendet.",
-                "`<dorf>` fehlt: Hauptdorf (`HD`) wird verwendet.",
-                "`seit <zeit>` kann optional vorher oder nachher dazugefuegt werden als erste sichtbare Zeit und wird dann statt der aktuellen Zeit verwendet.",
-                "Auch `1/2`, `1|2` oder `(1/2)` gehen anstatt Spieler und Dorf.",
-                "Mehrere Angriffszeilen in einer Nachricht sind moeglich. Nachtraegliches Ergaenzen per Bearbeiten geht auch.",
-                "Bitte moeglichst frueh melden. Schreibfehler bei Spieler- und Dorfnamen werden bestmoeglich korrigiert.",
-            ]
-        )
-    )
+    await ctx.send(build_meldeformat_text())
 
 
 @app_commands.describe(
-    attack_string="Die Angriffszeile oder mehrere Angriffszeilen",
-    attacked_village="Optionales Zieldorf. Leer = Hauptdorf des passenden Discord-Spielers",
-    attacked_player="Optionaler Zielspieler. Leer = passender Discord-Spielername",
+    attack_string="Zielkoordinaten plus eine oder mehrere Angriffszeilen",
     seit="Optional: seit wann der Angriff sichtbar ist, z. B. 20:34 oder 2026-04-30 20:34",
 )
 @bot.tree.command(name="melden", description="Meldet einen Angriff strukturiert")
 async def slash_melden(
     interaction: discord.Interaction,
     attack_string: str,
-    attacked_village: str | None = None,
-    attacked_player: str | None = None,
     seit: str | None = None,
 ) -> None:
     reference_time = discord.utils.utcnow().astimezone()
@@ -1277,47 +1304,45 @@ async def slash_melden(
         )
         return
 
-    resolved_attack_string = await resolve_interaction_user_mentions(
-        attack_string,
-        interaction,
-    )
-    resolved_attacked_player = (
-        await resolve_interaction_user_mentions(attacked_player, interaction)
-        if attacked_player
-        else None
-    )
-    defender_name_hint = get_defender_name_hint_from_user(interaction.user)
-    defender_name_override = resolved_attacked_player.strip() if resolved_attacked_player and resolved_attacked_player.strip() else None
-    defender_village_override = attacked_village.strip() if attacked_village and attacked_village.strip() else None
-
     rendered_messages: list[tuple[discord.Embed, object]] = []
     parsed_count = 0
     duplicate_count = 0
-    for part in split_attack_messages(resolved_attack_string):
-        rendered = build_attack_embed_from_source(
-            message_content=part,
-            noted_time=reference_time,
-            defender_name_hint=defender_name_hint,
-            message_url=None,
-            defender_name_override=defender_name_override,
-            defender_village_override=defender_village_override,
-            noted_time_hint=seit,
-        )
-        if rendered is None:
-            continue
-        parsed_count += 1
-        embed, resolution = rendered
-        if history_store.contains(
-            resolution.attacker_village.village_id,
-            resolution.defender_village.village_id,
-        ):
-            duplicate_count += 1
-            continue
-        rendered_messages.append((embed, resolution))
-
-    if parsed_count == 0:
+    message_parts = split_attack_messages(attack_string)
+    if not message_parts:
         await interaction.response.send_message(
-            "Ich konnte aus `attack_string` keine gueltige Angriffsmeldung lesen.",
+            f"Ich konnte aus `attack_string` keine gueltige Angriffsmeldung lesen. Fehler: {explain_attack_parse_failure(attack_string)}",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        for part in message_parts:
+            rendered = build_attack_embed_from_source(
+                message_content=part,
+                noted_time=reference_time,
+                message_url=None,
+                noted_time_hint=seit,
+            )
+            if rendered is None:
+                raise AttackParseError(explain_attack_parse_failure(part))
+            parsed_count += 1
+            embed, resolution = rendered
+            if history_store.contains(
+                resolution.attacker_village.village_id,
+                resolution.defender_village.village_id,
+            ):
+                duplicate_count += 1
+                continue
+            rendered_messages.append((embed, resolution))
+    except AttackParseError as exc:
+        await interaction.response.send_message(
+            f"Ich konnte aus `attack_string` keine gueltige Angriffsmeldung lesen. Fehler: {exc.user_message}",
+            ephemeral=True,
+        )
+        return
+    except ValueError as exc:
+        await interaction.response.send_message(
+            f"Ich konnte diese Angriffsmeldung nicht mit den Kartendaten abgleichen. Fehler: {exc}",
             ephemeral=True,
         )
         return
@@ -1348,10 +1373,11 @@ async def on_message(message: discord.Message) -> None:
         await message.channel.send(DM_REJECTION_TEXT)
         return
 
-    if not is_message_in_watch_channel(message):
+    if not is_message_in_bot_channel(message):
         return
 
-    await process_attack_message(message)
+    if is_message_in_watch_channel(message):
+        await process_attack_message(message)
     await bot.process_commands(message)
 
 

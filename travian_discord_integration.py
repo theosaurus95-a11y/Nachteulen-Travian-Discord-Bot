@@ -13,11 +13,9 @@ from travian_kingdoms_api import (
     Village,
     build_travel_guess,
     build_village,
-    get_main_village_of_player,
     get_most_similar_player_name,
     get_most_similar_village_of_player,
     guess_tp_levels,
-    list_player_villages,
     players_data,
     speed_troops_from_payload,
     troop_speed_per_hour,
@@ -26,30 +24,74 @@ from travian_kingdoms_api import (
 from troop_speeds import get_possible_base_speeds_x1, get_possible_world_speeds
 
 
+ATTACK_TYPE_PATTERN = r"angriff|attack|raubzug|raid|belagerung|siege"
 ATTACK_PATTERN = re.compile(
-    r"(?is)"
-    r"(?:\b(?:angriff|attack|belagerung|siege)\b[\s:,-]*)?"
-    r"(?:von|by)\s+"
-    r"(?P<attacker>.+?)\s+"
-    r"(?:aus|from)\s+"
-    r"(?P<attacking_village>.+?)\s*"
-    r"in\s*(?P<travel_time>\d{1,2}:\d{2}:\d{2})\s+"
-    r"(?:um|at)\s+(?P<arrival_time>\d{1,2}:\d{2}:\d{2})"
+    rf"(?is)"
+    rf"\s*"
+    rf"(?P<attack_type>{ATTACK_TYPE_PATTERN})\b[\s:,-]*"
+    rf"(?:von|by)\s+"
+    rf"(?P<attacker>.+?)\s+"
+    rf"(?:aus|from)\s+"
+    rf"(?P<attacking_village>.+?)(?=\s*in\s*\d{{1,2}}:\d{{2}}:\d{{2}})"
+    rf"\s*in\s*(?P<travel_time>\d{{1,2}}:\d{{2}}:\d{{2}})\s+"
+    rf"(?:um|at)\s+(?P<arrival_time>\d{{1,2}}:\d{{2}}:\d{{2}})"
 )
 SINCE_LINE_PATTERN = re.compile(r"(?i)^\s*seit\s+(?P<value>.+?)\s*$")
 TIME_ONLY_PATTERN = re.compile(r"^\s*(?P<hour>\d{1,2}):(?P<minute>\d{2})(?::(?P<second>\d{2}))?\s*$")
-COORDINATE_PATTERN = re.compile(
-    r"(?<!\d)\(?\s*(?P<x>-?\d{1,3})\s*(?:/|\|)\s*(?P<y>-?\d{1,3})\s*\)?(?!\d)"
+COORDINATE_SIGN = r"[+\-\u2212\u2010\u2011\u2012\u2013\u2014]?"
+COORDINATE_NUMBER = rf"{COORDINATE_SIGN}\d{{1,3}}"
+COORDINATE_LABEL_SEPARATOR = r"\s*(?::|=|\s)\s*"
+COORDINATE_XY_LABEL_PATTERN = re.compile(
+    rf"(?i)(?<!\w)x{COORDINATE_LABEL_SEPARATOR}(?P<x>{COORDINATE_NUMBER})"
+    rf"\s*(?:[,;/|]|\s)+\s*y{COORDINATE_LABEL_SEPARATOR}(?P<y>{COORDINATE_NUMBER})(?!\d)"
+)
+COORDINATE_YX_LABEL_PATTERN = re.compile(
+    rf"(?i)(?<!\w)y{COORDINATE_LABEL_SEPARATOR}(?P<y>{COORDINATE_NUMBER})"
+    rf"\s*(?:[,;/|]|\s)+\s*x{COORDINATE_LABEL_SEPARATOR}(?P<x>{COORDINATE_NUMBER})(?!\d)"
+)
+COORDINATE_WRAPPED_PAIR_PATTERN = re.compile(
+    rf"(?<!\d)[\(\[\{{<]\s*(?P<x>{COORDINATE_NUMBER})"
+    rf"\s*(?:/|\||,|;)\s*(?P<y>{COORDINATE_NUMBER})\s*[\)\]\}}>](?!\d)"
+)
+COORDINATE_PAIR_PATTERN = re.compile(
+    rf"(?<![\w/.-])(?P<x>{COORDINATE_NUMBER})"
+    rf"\s*(?:/|\||,|;)\s*(?P<y>{COORDINATE_NUMBER})(?![\w/.-])"
+)
+COORDINATE_BRACKETED_SPACE_PATTERN = re.compile(
+    rf"(?<!\d)[\(\[\{{<]\s*(?P<x>{COORDINATE_NUMBER})"
+    rf"\s+(?P<y>{COORDINATE_NUMBER})\s*[\)\]\}}>](?!\d)"
+)
+COORDINATE_SPACE_PAIR_PATTERN = re.compile(
+    rf"(?<![\w/.:+-])(?P<x>{COORDINATE_NUMBER})"
+    rf"\s+(?P<y>{COORDINATE_NUMBER})(?![\w/.:+-])"
+)
+COORDINATE_PATTERNS = (
+    COORDINATE_XY_LABEL_PATTERN,
+    COORDINATE_YX_LABEL_PATTERN,
+    COORDINATE_WRAPPED_PAIR_PATTERN,
+    COORDINATE_PAIR_PATTERN,
+    COORDINATE_BRACKETED_SPACE_PATTERN,
+    COORDINATE_SPACE_PAIR_PATTERN,
+)
+COORDINATE_IGNORED_CHARS = str.maketrans(
+    "",
+    "",
+    "\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069",
 )
 MAX_STANDARD_GUESS_AGE_SECONDS = 60 * 60
+
+
+class AttackParseError(ValueError):
+    def __init__(self, user_message: str) -> None:
+        super().__init__(user_message)
+        self.user_message = user_message
+
 
 @dataclass(frozen=True)
 class ParsedAttackMessage:
     raw_text: str
-    defender_name_hint: str | None
     defender_village_hint: str | None
     defender_coordinates_hint: tuple[int, int] | None
-    use_message_author_for_defender: bool
     visible_since_text: str | None
     attacker_hint: str
     attacking_village_hint: str
@@ -76,7 +118,6 @@ class AttackResolution:
     distance: float
     guesses: dict[str, TravelGuess | None]
     alternative_guess: TravelGuess | None
-    defender_used_main_village: bool
 
 
 TRANSLATIONS = {
@@ -107,142 +148,170 @@ def load_map_payload(path: str = "travian-map-data.json") -> dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def _extract_coordinates(value: str | None) -> tuple[int, int] | None:
-    if not value:
+def _parse_coordinate_number(value: str) -> int:
+    normalized = value.translate(str.maketrans({
+        "\u2212": "-",
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+    }))
+    return int(normalized)
+
+
+def _normalize_coordinate_text(value: str) -> str:
+    return value.translate(COORDINATE_IGNORED_CHARS)
+
+
+def _strip_discord_format_edges(value: str) -> str:
+    return value.strip("\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+
+
+def _parse_literal_village_line(value: str) -> str | None:
+    cleaned = _strip_discord_format_edges(value)
+    if cleaned.startswith("  ") or cleaned.endswith("  "):
         return None
-    match = COORDINATE_PATTERN.search(value)
-    if match is None:
-        return None
-    return int(match.group("x")), int(match.group("y"))
+    village_name = cleaned.strip(" ")
+    return village_name or None
 
 
-def _strip_coordinates(value: str) -> str:
-    return _clean_segment(COORDINATE_PATTERN.sub(" ", value).strip())
+def _coordinates_from_match(match: re.Match[str]) -> tuple[int, int]:
+    return (
+        _parse_coordinate_number(match.group("x")),
+        _parse_coordinate_number(match.group("y")),
+    )
 
 
-def _strip_optional_coordinates(value: str | None) -> str | None:
-    if value is None:
-        return None
-    stripped = _strip_coordinates(value)
-    return stripped or None
-
-
-def _extract_leading_defender_hint(content: str) -> tuple[str | None, str] | None:
-    match = ATTACK_PATTERN.search(content)
-    if match is None or match.start() == 0:
-        return None
-
-    lines = [
-        line.strip().rstrip(":")
-        for line in content[: match.start()].splitlines()
-        if line.strip()
-    ]
-    if not lines:
-        return None
-
-    return _strip_optional_coordinates(lines[-1]), content[match.start() :].strip()
-
-
-def _extract_defender_coordinates(
-    content: str,
-    *hints: str | None,
-) -> tuple[int, int] | None:
-    for hint in hints:
-        coordinates = _extract_coordinates(hint)
-        if coordinates is not None:
-            return coordinates
-
-    match = ATTACK_PATTERN.search(content)
-    if match is None:
-        return _extract_coordinates(content)
-
-    for segment in (content[: match.start()], content[match.end() :]):
-        coordinates = _extract_coordinates(segment)
-        if coordinates is not None:
-            return coordinates
+def _search_coordinates(value: str) -> re.Match[str] | None:
+    for pattern in COORDINATE_PATTERNS:
+        match = pattern.search(value)
+        if match is not None:
+            return match
     return None
 
 
-def parse_attack_message(content: str) -> ParsedAttackMessage | None:
-    compact = content.strip()
-    if not compact:
+def extract_coordinates(value: str | None) -> tuple[int, int] | None:
+    if not value:
         return None
 
-    defender_name_hint: str | None = None
-    defender_village_hint: str | None = None
-    use_message_author_for_defender = False
-    override = _extract_defender_override(compact)
-    if override is not None:
-        defender_name_hint, defender_village_hint, compact, use_message_author_for_defender = override
+    normalized = _normalize_coordinate_text(value)
+    match = _search_coordinates(normalized)
+    return _coordinates_from_match(match) if match is not None else None
+
+
+def _extract_literal_village_header(content: str) -> tuple[str, str] | None:
+    match = ATTACK_PATTERN.search(content)
+    if match is None:
+        return None
+
+    attack_start = match.start("attack_type")
+    if attack_start == 0:
+        return None
+
+    prefix_lines = content[:attack_start].splitlines()
+    non_empty_lines = [line for line in prefix_lines if _parse_literal_village_line(line)]
+    if len(non_empty_lines) != 1:
+        return None
+
+    village = _parse_literal_village_line(non_empty_lines[0])
+    if village is None:
+        return None
+    return village, content[attack_start:]
+
+
+def parse_attack_message(content: str) -> ParsedAttackMessage | None:
+    compact = _normalize_coordinate_text(content).strip("\r\n")
+    if not compact.strip():
+        return None
 
     visible_since_text, compact = _extract_visible_since_hint(compact)
-    coordinate_source = compact
+    defender_coordinates_hint = extract_coordinates(compact)
+    defender_village_hint: str | None = None
 
-    prefix_match = re.match(r"(?s)^\s*([^:\n]{1,80})\s*:\s*(.+)$", compact)
-    if prefix_match:
-        possible_hint = prefix_match.group(1).strip()
-        remaining = prefix_match.group(2).strip()
-        if ATTACK_PATTERN.search(remaining):
-            defender_village_hint = _strip_coordinates(possible_hint)
-            compact = remaining
-    else:
-        prefixed_hint = _extract_leading_defender_hint(compact)
-        if prefixed_hint is not None:
-            defender_village_hint, compact = prefixed_hint
+    if defender_coordinates_hint is None:
+        literal_village = _extract_literal_village_header(compact)
+        if literal_village is None:
+            return None
+        defender_village_hint, compact = literal_village
 
     match = ATTACK_PATTERN.search(compact)
     if not match:
         return None
 
-    defender_coordinates_hint = _extract_defender_coordinates(
-        coordinate_source,
-        defender_village_hint,
-    )
-    defender_name_hint = _strip_optional_coordinates(defender_name_hint)
-    defender_village_hint = _strip_optional_coordinates(defender_village_hint)
-    lowered = compact.casefold()
+    attack_type = (match.group("attack_type") or "").casefold()
     return ParsedAttackMessage(
         raw_text=content,
-        defender_name_hint=defender_name_hint,
         defender_village_hint=defender_village_hint,
         defender_coordinates_hint=defender_coordinates_hint,
-        use_message_author_for_defender=use_message_author_for_defender,
         visible_since_text=visible_since_text,
         attacker_hint=_clean_segment(match.group("attacker")),
         attacking_village_hint=_clean_segment(match.group("attacking_village")),
         travel_time_text=match.group("travel_time"),
         arrival_time_text=match.group("arrival_time"),
-        is_siege=("belagerung" in lowered) or ("siege" in lowered),
+        is_siege=attack_type in {"belagerung", "siege"},
     )
 
 
 def split_attack_messages(content: str) -> list[str]:
-    lines = [line.strip() for line in content.splitlines() if line.strip()]
-    if not lines:
+    compact = _normalize_coordinate_text(content).strip("\r\n")
+    if not compact.strip():
         return []
 
-    attack_indices = [index for index, line in enumerate(lines) if ATTACK_PATTERN.search(line)]
-    if len(attack_indices) <= 1:
-        return [content]
+    prefix = ""
+    coordinate_match = _search_coordinates(compact)
+    if coordinate_match is not None:
+        prefix = compact[: coordinate_match.end()]
+        remaining = compact[coordinate_match.end() :]
+    else:
+        literal_village = _extract_literal_village_header(compact)
+        if literal_village is None:
+            return []
+        prefix, remaining = literal_village
 
-    shared_prefix = "\n".join(lines[:attack_indices[0]]).strip()
+    attack_matches = list(ATTACK_PATTERN.finditer(remaining))
+    if not attack_matches:
+        return []
+
     messages: list[str] = []
-    for index in attack_indices:
-        line = lines[index]
-        if shared_prefix and not line.casefold().startswith("auf "):
-            messages.append(f"{shared_prefix}\n{line}")
-        else:
-            messages.append(line)
+    for index, match in enumerate(attack_matches):
+        next_start = (
+            attack_matches[index + 1].start()
+            if index + 1 < len(attack_matches)
+            else len(remaining)
+        )
+        attack_block = remaining[match.start() : next_start].strip()
+        messages.append(f"{prefix}\n{attack_block}")
     return messages
+
+
+def explain_attack_parse_failure(content: str) -> str:
+    compact = _normalize_coordinate_text(content).strip("\r\n")
+    if not compact.strip():
+        return "Die Nachricht ist leer."
+
+    first_attack_match = ATTACK_PATTERN.search(compact)
+    if first_attack_match is None:
+        return "Keine Angriffszeile gefunden."
+
+    coordinate_match = _search_coordinates(compact)
+    if coordinate_match is not None and coordinate_match.start() > first_attack_match.start("attack_type"):
+        return "Dorfkoordinaten muessen vor der ersten Angriffszeile stehen."
+
+    if coordinate_match is None and _extract_literal_village_header(compact) is None:
+        return (
+            "Dorfname nicht erkannt. Vor der ersten Angriffszeile muss genau eine "
+            "Dorfname-Zeile stehen; erlaubt ist hoechstens ein Leerzeichen davor "
+            "und hoechstens eins danach."
+        )
+
+    return "Die Angriffsmeldung konnte nicht vollstaendig gelesen werden."
 
 
 def resolve_attack_message(
     map_payload: dict[str, Any],
     message_content: str,
     noted_time: datetime,
-    defender_name_hint: str,
-    defender_name_override: str | None = None,
-    defender_village_override: str | None = None,
     noted_time_hint: str | None = None,
 ) -> AttackResolution | None:
     parsed = parse_attack_message(message_content)
@@ -253,10 +322,7 @@ def resolve_attack_message(
         noted_time,
         noted_time_hint or parsed.visible_since_text,
     ) or noted_time
-    defender_coordinates = (
-        _extract_coordinates(defender_village_override)
-        or parsed.defender_coordinates_hint
-    )
+    defender_coordinates = parsed.defender_coordinates_hint
     attacker_name = get_most_similar_player_name(map_payload, parsed.attacker_hint)
 
     if defender_coordinates is not None:
@@ -266,30 +332,21 @@ def resolve_attack_message(
             defender_coordinates[1],
         )
         if defender_match is None:
-            raise ValueError(
-                "No village found at coordinates: "
-                f"{defender_coordinates[0]}/{defender_coordinates[1]}"
+            raise AttackParseError(
+                "Dorfkoordinaten nicht erkannt: "
+                f"Bei `{defender_coordinates[0]}/{defender_coordinates[1]}` wurde kein Dorf gefunden."
             )
         defender = defender_match[0]
-        defender_name = defender.name
         defender_village = defender_match[1]
-        used_main_village = False
+    elif parsed.defender_village_hint:
+        defender_match = _find_unique_village_match_by_name(
+            map_payload,
+            parsed.defender_village_hint,
+        )
+        defender = defender_match[0]
+        defender_village = defender_match[1]
     else:
-        effective_defender_hint = (
-            defender_name_override
-            or (
-                defender_name_hint
-                if parsed.use_message_author_for_defender
-                else (parsed.defender_name_hint or defender_name_hint)
-            )
-        )
-        defender_name = get_most_similar_player_name(map_payload, effective_defender_hint)
-        defender = _find_player_match(map_payload, defender_name)
-        defender_village, used_main_village = _resolve_defender_village(
-            map_payload=map_payload,
-            defender_name=defender_name,
-            defender_village_hint=defender_village_override or parsed.defender_village_hint,
-        )
+        raise AttackParseError("Dorfname oder Dorfkoordinaten wurden nicht erkannt.")
 
     attacker_village = get_most_similar_village_of_player(
         map_payload,
@@ -331,7 +388,6 @@ def resolve_attack_message(
         distance=village_distance(attacker_village, defender_village),
         guesses=guesses,
         alternative_guess=alternative_guess,
-        defender_used_main_village=used_main_village,
     )
 
 
@@ -433,70 +489,6 @@ def _extract_visible_since_hint(content: str) -> tuple[str | None, str]:
     return since_value, "\n".join(remaining_lines).strip()
 
 
-def _extract_defender_override(content: str) -> tuple[str, str, str, bool] | None:
-    stripped = content.lstrip()
-    if not stripped.casefold().startswith("auf "):
-        return None
-
-    lines = stripped.splitlines()
-    if not lines:
-        return None
-
-    first_line = lines[0].strip()
-    after_auf = first_line[4:].strip()
-    remainder_lines = lines[1:]
-
-    if remainder_lines:
-        first_content_index = next(
-            (index for index, line in enumerate(remainder_lines) if line.strip()),
-            None,
-        )
-        if first_content_index is None:
-            return None
-
-        second_line = remainder_lines[first_content_index].strip()
-        if ATTACK_PATTERN.search(second_line):
-            defender = _clean_segment(after_auf)
-            remaining = "\n".join(remainder_lines[first_content_index:]).strip()
-            if defender and remaining:
-                return defender, "", remaining, _is_self_reference(defender)
-
-        if second_line and ATTACK_PATTERN.search(second_line) is None:
-            defender = _clean_segment(after_auf)
-            village = _clean_segment(second_line.rstrip(":"))
-            remaining = "\n".join(remainder_lines[first_content_index + 1 :]).strip()
-            if defender and village and remaining:
-                return defender, village, remaining, _is_self_reference(defender)
-
-    resolved = _split_inline_override_hint(after_auf)
-    if resolved is None or not remainder_lines:
-        return None
-
-    defender, village = resolved
-    remaining = "\n".join(remainder_lines).strip()
-    if not remaining:
-        return None
-    return defender, village.rstrip(":"), remaining, _is_self_reference(defender)
-
-
-def _split_inline_override_hint(value: str) -> tuple[str, str] | None:
-    cleaned = value.rstrip(":").strip()
-    if not cleaned:
-        return None
-    parts = cleaned.rsplit(None, 1)
-    if len(parts) != 2:
-        return None
-    defender, village = parts[0].strip(), parts[1].strip()
-    if not defender or not village:
-        return None
-    return defender, village
-
-
-def _is_self_reference(value: str) -> bool:
-    normalized = _clean_segment(value).casefold()
-    return normalized in {"mich", "mein", "uns", "unser"}
-
-
 def parse_flexible_noted_time(reference_time: datetime, raw_value: str | None) -> datetime | None:
     if not raw_value:
         return None
@@ -545,27 +537,6 @@ def parse_flexible_noted_time(reference_time: datetime, raw_value: str | None) -
     return candidate
 
 
-def _resolve_defender_village(
-    map_payload: dict[str, Any],
-    defender_name: str,
-    defender_village_hint: str | None,
-) -> tuple[Village, bool]:
-    if defender_village_hint:
-        return (
-            get_most_similar_village_of_player(map_payload, defender_name, defender_village_hint),
-            False,
-        )
-
-    main_village = get_main_village_of_player(map_payload, defender_name)
-    if main_village is not None:
-        return main_village, True
-
-    villages = list_player_villages(map_payload, defender_name)
-    if not villages:
-        raise ValueError(f"Player has no villages: {defender_name}")
-    return villages[0], True
-
-
 def _find_player_match(map_payload: dict[str, Any], player_name: str) -> PlayerMatch:
     for player in players_data(map_payload):
         if str(player.get("name", "")).casefold() == player_name.casefold():
@@ -591,6 +562,33 @@ def _find_village_match_by_coordinates(
             if village.x == x and village.y == y:
                 return player_match, village
     return None
+
+
+def _find_unique_village_match_by_name(
+    map_payload: dict[str, Any],
+    village_name: str,
+) -> tuple[PlayerMatch, Village]:
+    matches: list[tuple[PlayerMatch, Village]] = []
+    wanted_name = village_name.casefold()
+    for player in players_data(map_payload):
+        player_match = PlayerMatch(
+            name=str(player.get("name", "")),
+            player_id=str(player.get("playerId", "")),
+        )
+        for village_data in player.get("villages", []):
+            village = build_village(village_data)
+            if village.name.casefold() == wanted_name:
+                matches.append((player_match, village))
+
+    if not matches:
+        raise AttackParseError(
+            f"Dorfname nicht erkannt: `{village_name}` wurde in den Kartendaten nicht gefunden."
+        )
+    if len(matches) > 1:
+        raise AttackParseError(
+            f"Dorfname ist nicht eindeutig: `{village_name}` kommt mehrfach in den Kartendaten vor."
+        )
+    return matches[0]
 
 
 def _resolve_arrival_time(noted_time: datetime, arrival_text: str) -> datetime:

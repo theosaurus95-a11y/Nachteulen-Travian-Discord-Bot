@@ -51,6 +51,7 @@ Optionale Kanal- und Laufzeit-Einstellungen:
 ```env
 COMMAND_PREFIX=!
 WATCH_CHANNEL_IDS=1493215975288471607,1493215975288471608
+WATCH_CHANNEL_IDS_ONLY_COMMANDS=1493215975288471609,1493215975288471610
 OUTPUT_CHANNEL_ID=1493215975288471608
 BOT_LOCALE=de
 ATTACK_HISTORY_PATH=attack-history.json
@@ -58,7 +59,7 @@ LOG_FILE_PATH=logs/bot.log
 UPDATE_TK_COOLDOWN_SECONDS=300
 ```
 
-Der Bot nimmt keine Direktnachrichten an und reagiert nur in den Kanaelen aus `WATCH_CHANNEL_IDS`.
+Der Bot nimmt keine Direktnachrichten an. Angriffsmeldungen werden nur in Kanaelen aus `WATCH_CHANNEL_IDS` ausgewertet; Befehle funktionieren in `WATCH_CHANNEL_IDS` und `WATCH_CHANNEL_IDS_ONLY_COMMANDS`.
 
 ## Starten
 
