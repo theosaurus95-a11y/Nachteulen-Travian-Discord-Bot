@@ -13,13 +13,16 @@ Ein Discord-Bot für Travian-Kingdoms-Angriffsmeldungen. Der Bot liest Angriffsm
 - Verarbeitet mehrere Angriffsmeldungen in einer Discord-Nachricht
 - Unterstützt Dorfpräfixe wie `02:` und Zielüberschreibungen wie `auf mich`
 - Speichert gemeldete Angriffe und ignoriert doppelte Dorf-gegen-Dorf-Meldungen
-- Aktualisiert Historie und Travian-Kartendaten beim Start und taeglich um 01:00 Uhr
+- Prueft neue Siedlungen von KR-Mitgliedern gegen Siedelkanal-Ankuendigung und Schatzkammergebiet
+- Liest Siedelkoordinaten auch aus Screenshot-Anhaengen im Siedelkanal
+- Aktualisiert Historie und Travian-Kartendaten beim Start und taeglich um 00:30 Uhr
 
 ## Voraussetzungen
 
 - Python 3.10 oder neuer
 - Discord-Bot-Token
 - Privater Travian-Kingdoms-API-Schlüssel
+- Tesseract OCR fuer Screenshot-Erkennung
 
 ## Einrichtung
 
@@ -53,8 +56,16 @@ COMMAND_PREFIX=!
 WATCH_CHANNEL_IDS=1493215975288471607,1493215975288471608
 WATCH_CHANNEL_IDS_ONLY_COMMANDS=1493215975288471609,1493215975288471610
 OUTPUT_CHANNEL_ID=1493215975288471608
+SETTLEMENT_ANNOUNCEMENT_CHANNEL_ID=1493215975288471611
+RULE_OUTPUT_CHANNEL_ID=1493215975288471612
+SETTLEMENT_ANNOUNCEMENT_HISTORY_LIMIT=50
 BOT_LOCALE=de
 ATTACK_HISTORY_PATH=attack-history.json
+TRAVIAN_MAP_DATA_PATH=travian-map-data.json
+TRAVIAN_MAP_DATA_YESTERDAY_PATH=travian-map-data-yesterday.json
+KINGDOM_MEMBERS_PATH=kingdom-members.json
+TREASURY_COORDINATES_PATH=treasury-coordinates.json
+SETTLEMENT_REPORTS_PATH=settlement-rule-reports.json
 LOG_FILE_PATH=logs/bot.log
 UPDATE_TK_COOLDOWN_SECONDS=300
 ```
@@ -97,6 +108,10 @@ auf mich 02:
 Angriff von Pilgerfuchs aus Fuchsbau in 01:35:38 um 20:00:54
 ```
 
+Bei Dörfern, die jünger als einen Tag sind, müssen Koordinaten angegeben werden, weil sie noch fehlen können. Wenn Koordinaten angegeben sind, nutzt der Bot genau diese Koordinaten auch dann, wenn dort noch kein Dorf in den API-Daten steht.
+
+Wenn eine Angriffsmeldung nachträglich bearbeitet wird, verwendet der Bot die Bearbeitungszeit als Meldezeit.
+
 ## Bot-Befehle
 
 - `!hilfe` oder `!help` - zeigt die Befehlsübersicht
@@ -105,8 +120,23 @@ Angriff von Pilgerfuchs aus Fuchsbau in 01:35:38 um 20:00:54
 - `!ping` - zeigt die Latenz
 - `!hallo` oder `!hello` - einfacher Funktionstest
 - `!summary` - fasst gespeicherte Angriffe nach Angreifern zusammen
+- `!summarylaufend` - fasst aktuell noch laufende Angriffe nach Angreifern zusammen
+- `!summarydorf` - fasst gespeicherte Angriffe nach Zieldorf zusammen
+- `!summarydorflaufend` - fasst aktuell noch laufende Angriffe nach Zieldorf zusammen
 - `!reset` - leert die Angriffshistorie
 - `!updateTK` - aktualisiert die Travian-Kartendaten
+- `!krmitglieder` - zeigt die KR-Mitgliederliste fuer Siedelregeln
+- `!krmitglieder-setzen Name1; Name2` - ueberschreibt die KR-Mitgliederliste
+- `!schatzkammern` - zeigt die Schatzkammer-Koordinaten
+- `!schatzkammern-setzen 12|34; 13|35` - ueberschreibt die Schatzkammer-Koordinaten
+
+## Siedelregeln
+
+Der Bot legt vor jedem geaenderten Map-Snapshot die alte Datei als `travian-map-data-yesterday.json` ab. Aus der Differenz erkennt er neue Doerfer von Spielern aus `kingdom-members.json`.
+
+Eine neue Siedlung ist regelwidrig, wenn die Koordinate nicht vorher in den letzten 50 Nachrichten des `SETTLEMENT_ANNOUNCEMENT_CHANNEL_ID`-Kanals auftauchte oder wenn sie ausserhalb des Schatzkammergebiets liegt und kein Feld mit `resType` `3339` oder `11115` ist. Der Bot liest dabei Textnachrichten und Bildanhaenge mit Koordinaten im Format `(x|y)`. Das Schatzkammergebiet entsteht aus allen Koordinaten in `treasury-coordinates.json` mit Radius `4.2`.
+
+Regelverstoesse werden in `RULE_OUTPUT_CHANNEL_ID` gemeldet; wenn der nicht gesetzt ist, wird `OUTPUT_CHANNEL_ID` verwendet.
 
 ## Travian-API-Helfer
 
@@ -139,6 +169,9 @@ python .\travian_kingdoms_api.py get-map-data `
 
 - `bot.py` - Discord-Bot, Events und Befehle
 - `bot_runtime.py` - Angriffshistorie und Laufzeit-Helfer
+- `settlement_rules.py` - Siedelregel-Diff, Speicherdateien und Regelbewertung
+- `settlement_discord.py` - Discord-Befehle und Regelmeldungen fuer Siedelregeln
+- `settlement_ocr.py` - optionale OCR-Erkennung fuer Siedel-Screenshots
 - `travian_discord_integration.py` - Parsing, Zuordnung und Discord-Formatierung
 - `travian_kingdoms_api.py` - Travian-Kingdoms-API-Helfer
 - `example_travian_usage.py` - lokale Beispiele mit Kartendaten

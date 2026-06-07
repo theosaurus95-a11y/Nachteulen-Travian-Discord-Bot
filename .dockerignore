@@ -16,6 +16,11 @@ raspberry-logs/
 
 raspberry-pi-info.txt
 attack-history.json
+travian-map-data.json
+travian-map-data-yesterday.json
+kingdom-members.json
+treasury-coordinates.json
+settlement-rule-reports.json
 
 deploy-to-raspberry-pi.ps1
 get-raspberry-log.ps1

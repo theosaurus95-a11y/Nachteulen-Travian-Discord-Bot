@@ -53,9 +53,16 @@ COORDINATE_WRAPPED_PAIR_PATTERN = re.compile(
     rf"(?<!\d)[\(\[\{{<]\s*(?P<x>{COORDINATE_NUMBER})"
     rf"\s*(?:/|\||,|;)\s*(?P<y>{COORDINATE_NUMBER})\s*[\)\]\}}>](?!\d)"
 )
+COORDINATE_PAIR_TRAILING_DOT_PATTERN = re.compile(
+    rf"(?<![\w/.-])(?P<x>{COORDINATE_NUMBER})"
+    rf"\s*(?:/|\||,|;)\s*(?P<y>{COORDINATE_NUMBER})\.(?!\d)"
+)
 COORDINATE_PAIR_PATTERN = re.compile(
     rf"(?<![\w/.-])(?P<x>{COORDINATE_NUMBER})"
     rf"\s*(?:/|\||,|;)\s*(?P<y>{COORDINATE_NUMBER})(?![\w/.-])"
+)
+COORDINATE_COMPACT_SIGNED_PAIR_PATTERN = re.compile(
+    rf"(?<![\w/.:+\-])(?P<x>{COORDINATE_NUMBER})(?P<y>[+\-\u2212\u2010\u2011\u2012\u2013\u2014]\d{{1,3}})(?![\w/.:+\-])"
 )
 COORDINATE_BRACKETED_SPACE_PATTERN = re.compile(
     rf"(?<!\d)[\(\[\{{<]\s*(?P<x>{COORDINATE_NUMBER})"
@@ -69,7 +76,9 @@ COORDINATE_PATTERNS = (
     COORDINATE_XY_LABEL_PATTERN,
     COORDINATE_YX_LABEL_PATTERN,
     COORDINATE_WRAPPED_PAIR_PATTERN,
+    COORDINATE_PAIR_TRAILING_DOT_PATTERN,
     COORDINATE_PAIR_PATTERN,
+    COORDINATE_COMPACT_SIGNED_PAIR_PATTERN,
     COORDINATE_BRACKETED_SPACE_PATTERN,
     COORDINATE_SPACE_PAIR_PATTERN,
 )
@@ -124,7 +133,7 @@ TRANSLATIONS = {
     "de": {
         "attack_normal": "Angriff erkannt",
         "attack_siege": "Belagerung erkannt",
-        "from_to": "Von [{attacker}]({attacker_link}) / [{attacker_village}]({attacker_village_link}) nach [{defender}]({defender_link}) / [{defender_village}]({defender_village_link})",
+        "from_to": "Von {attacker_ref} / {attacker_village_ref} nach {defender_ref} / {defender_village_ref}",
         "noted_time": "Meldezeit",
         "arrival_time": "Ankunft",
         "remaining_time": "Restlaufzeit",
@@ -198,6 +207,31 @@ def extract_coordinates(value: str | None) -> tuple[int, int] | None:
     normalized = _normalize_coordinate_text(value)
     match = _search_coordinates(normalized)
     return _coordinates_from_match(match) if match is not None else None
+
+
+def extract_all_coordinates(value: str | None) -> list[tuple[int, int]]:
+    if not value:
+        return []
+
+    normalized = _normalize_coordinate_text(value)
+    matches: list[tuple[int, int, tuple[int, int]]] = []
+    for pattern in COORDINATE_PATTERNS:
+        for match in pattern.finditer(normalized):
+            matches.append((match.start(), match.end(), _coordinates_from_match(match)))
+
+    matches.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    coordinates: list[tuple[int, int]] = []
+    seen_coordinates: set[tuple[int, int]] = set()
+    covered_spans: list[tuple[int, int]] = []
+    for start, end, coordinate in matches:
+        if any(start >= covered_start and end <= covered_end for covered_start, covered_end in covered_spans):
+            continue
+        covered_spans.append((start, end))
+        if coordinate in seen_coordinates:
+            continue
+        seen_coordinates.add(coordinate)
+        coordinates.append(coordinate)
+    return coordinates
 
 
 def _extract_literal_village_header(content: str) -> tuple[str, str] | None:
@@ -332,12 +366,14 @@ def resolve_attack_message(
             defender_coordinates[1],
         )
         if defender_match is None:
-            raise AttackParseError(
-                "Dorfkoordinaten nicht erkannt: "
-                f"Bei `{defender_coordinates[0]}/{defender_coordinates[1]}` wurde kein Dorf gefunden."
+            defender = _build_unknown_defender()
+            defender_village = _build_coordinate_only_village(
+                defender_coordinates[0],
+                defender_coordinates[1],
             )
-        defender = defender_match[0]
-        defender_village = defender_match[1]
+        else:
+            defender = defender_match[0]
+            defender_village = defender_match[1]
     elif parsed.defender_village_hint:
         defender_match = _find_unique_village_match_by_name(
             map_payload,
@@ -401,6 +437,22 @@ def build_player_link(server_url: str, player: PlayerMatch) -> str:
 def build_village_link(server_url: str, village: Village) -> str:
     return (
         f"{server_url.rstrip('/')}/#/page:map/x:{village.x}/y:{village.y}/window:sendTroops"
+    )
+
+
+def _build_unknown_defender() -> PlayerMatch:
+    return PlayerMatch(name="Unbekannt", player_id="")
+
+
+def _build_coordinate_only_village(x: int, y: int) -> Village:
+    return Village(
+        village_id=f"coordinates:{x}:{y}",
+        name=f"{x}/{y}",
+        x=x,
+        y=y,
+        population=0,
+        is_main_village=False,
+        is_city=False,
     )
 
 

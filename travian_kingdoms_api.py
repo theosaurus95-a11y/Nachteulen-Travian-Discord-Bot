@@ -208,6 +208,25 @@ def gameworld_data(map_payload: dict[str, Any]) -> dict[str, Any]:
     return response_data(map_payload).get("gameworld", {})
 
 
+def map_cells_data(map_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return response_data(map_payload).get("map", {}).get("cells", [])
+
+
+def find_map_cell(
+    map_payload: dict[str, Any],
+    x: int,
+    y: int,
+) -> dict[str, Any] | None:
+    for cell in map_cells_data(map_payload):
+        if to_int(cell.get("x")) == x and to_int(cell.get("y")) == y:
+            return cell
+    return None
+
+
+def build_village_map_link(server_url: str, x: int, y: int) -> str:
+    return f"{server_url.rstrip('/')}/#/page:map/x:{x}/y:{y}/window:sendTroops"
+
+
 def speed_troops_from_payload(map_payload: dict[str, Any]) -> float:
     speed_troops = gameworld_data(map_payload).get("speedTroops")
     if speed_troops is None:

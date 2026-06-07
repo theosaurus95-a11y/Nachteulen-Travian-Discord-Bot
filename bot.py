@@ -14,7 +14,18 @@ from bot_runtime import (
     AttackHistoryStore,
     build_history_entry,
     current_local_date,
+    filter_running_history_entries,
     refresh_map_snapshot,
+)
+from settlement_discord import (
+    SettlementDiscordConfig,
+    register_settlement_commands,
+    run_settlement_rule_check,
+)
+from settlement_rules import (
+    NameListStore,
+    SettlementReportStore,
+    TreasuryCoordinateStore,
 )
 
 from travian_discord_integration import (
@@ -73,14 +84,34 @@ raw_channel_ids = os.getenv("WATCH_CHANNEL_IDS", "")
 raw_command_only_channel_ids = os.getenv("WATCH_CHANNEL_IDS_ONLY_COMMANDS", "")
 TRAVIAN_SERVER_URL = os.getenv("TRAVIAN_SERVER_URL", "").strip()
 TRAVIAN_MAP_DATA_PATH = os.getenv("TRAVIAN_MAP_DATA_PATH", "travian-map-data.json")
+TRAVIAN_MAP_DATA_YESTERDAY_PATH = os.getenv(
+    "TRAVIAN_MAP_DATA_YESTERDAY_PATH",
+    "travian-map-data-yesterday.json",
+)
 TRAVIAN_PRIVATE_API_KEY = os.getenv("TRAVIAN_PRIVATE_API_KEY", "").strip() or None
 TRAVIAN_TOOL_EMAIL = os.getenv("TRAVIAN_TOOL_EMAIL", "").strip()
 TRAVIAN_TOOL_NAME = os.getenv("TRAVIAN_TOOL_NAME", "").strip()
 TRAVIAN_TOOL_URL = os.getenv("TRAVIAN_TOOL_URL", "").strip()
 TRAVIAN_TOOL_PUBLIC = os.getenv("TRAVIAN_TOOL_PUBLIC", "false").strip().lower() == "true"
 ATTACK_HISTORY_PATH = os.getenv("ATTACK_HISTORY_PATH", "attack-history.json")
+KINGDOM_MEMBERS_PATH = os.getenv("KINGDOM_MEMBERS_PATH", "kingdom-members.json")
+TREASURY_COORDINATES_PATH = os.getenv("TREASURY_COORDINATES_PATH", "treasury-coordinates.json")
+SETTLEMENT_REPORTS_PATH = os.getenv("SETTLEMENT_REPORTS_PATH", "settlement-rule-reports.json")
 BOT_LOCALE = os.getenv("BOT_LOCALE", "de").strip() or "de"
 OUTPUT_CHANNEL_ID = int(os.getenv("OUTPUT_CHANNEL_ID", "0").strip() or "0")
+SETTLEMENT_ANNOUNCEMENT_CHANNEL_ID = int(
+    os.getenv("SETTLEMENT_ANNOUNCEMENT_CHANNEL_ID", "0").strip() or "0"
+)
+RULE_OUTPUT_CHANNEL_ID = int(
+    os.getenv("RULE_OUTPUT_CHANNEL_ID", "").strip() or str(OUTPUT_CHANNEL_ID or 0)
+)
+SETTLEMENT_ANNOUNCEMENT_HISTORY_LIMIT = int(
+    os.getenv("SETTLEMENT_ANNOUNCEMENT_HISTORY_LIMIT", "50").strip() or "50"
+)
+SETTLEMENT_ANNOUNCEMENT_HISTORY_LIMIT = max(
+    1,
+    min(SETTLEMENT_ANNOUNCEMENT_HISTORY_LIMIT, 50),
+)
 LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "logs/bot.log")
 LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", "1048576"))
 LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "6"))
@@ -162,6 +193,7 @@ def build_meldeformat_text(
             "```",
             "Koordinaten können auch mit `|` oder Leerzeichen getrennt sein, oder Kartenlinks sein.",
             "Das vorherige Meldeformat mit Dorfname statt Dorfkoordinaten wird auch weiterhin unterstützt, ist aber fehleranfälliger.",
+            "Bei Dörfern, die jünger als einen Tag sind, müssen Koordinaten angegeben werden.",
         ]
     )
     return "\n".join(lines)
@@ -288,9 +320,28 @@ _travian_map_payload: dict | None = None
 _travian_map_mtime_ns: int | None = None
 _last_maintenance_date: str | None = None
 _pending_history_summary: list[str] = []
+_startup_settlement_check_done = False
 _update_tk_cooldown_until: dict[int, float] = {}
 _update_tk_running_scopes: set[int] = set()
 history_store = AttackHistoryStore(ATTACK_HISTORY_PATH)
+kingdom_member_store = NameListStore(KINGDOM_MEMBERS_PATH)
+treasury_store = TreasuryCoordinateStore(TREASURY_COORDINATES_PATH)
+settlement_report_store = SettlementReportStore(SETTLEMENT_REPORTS_PATH)
+for store in (kingdom_member_store, treasury_store, settlement_report_store):
+    store.ensure_exists()
+
+settlement_discord_config = SettlementDiscordConfig(
+    server_url=TRAVIAN_SERVER_URL,
+    settlement_announcement_channel_id=SETTLEMENT_ANNOUNCEMENT_CHANNEL_ID,
+    rule_output_channel_id=RULE_OUTPUT_CHANNEL_ID,
+    announcement_history_limit=SETTLEMENT_ANNOUNCEMENT_HISTORY_LIMIT,
+)
+register_settlement_commands(
+    bot,
+    member_store=kingdom_member_store,
+    treasury_store=treasury_store,
+    map_payload_path=TRAVIAN_MAP_DATA_PATH,
+)
 
 HELP_LINES = [
     "Verfuegbare Befehle:",
@@ -300,12 +351,18 @@ HELP_LINES = [
     f"`{PREFIX}ping` - Zeigt die aktuelle Bot-Latenz",
     f"`{PREFIX}hallo` oder `{PREFIX}hello` - Kurzer Funktionstest",
     f"`{PREFIX}summary` - Fasst die gespeicherten Angriffe zusammen",
+    f"`{PREFIX}summarylaufend` - Fasst aktuell noch laufende Angriffe zusammen",
     f"`{PREFIX}summarydorf` - Fasst die gespeicherten Angriffe nach Zieldorf zusammen",
+    f"`{PREFIX}summarydorflaufend` - Fasst aktuell noch laufende Angriffe nach Zieldorf zusammen",
     f"`{PREFIX}angreiferliste` - Gibt Angreiferdoerfer tabellarisch zum Kopieren aus",
     f"`{PREFIX}verteidigerliste` - Gibt Zieldoerfer tabellarisch zum Kopieren aus",
     f"`{PREFIX}reset` - Leert die Angriffshistorie",
     f"`{PREFIX}updateTK` - Aktualisiert die Travian-Kartendaten manuell",
     f"`{PREFIX}meldeformat` - Zeigt das empfohlene Format fuer manuelle Meldungen",
+    f"`{PREFIX}krmitglieder` - Zeigt die KR-Mitgliederliste fuer Siedelregeln",
+    f"`{PREFIX}krmitglieder-setzen Name1; Name2` - Ueberschreibt die KR-Mitgliederliste",
+    f"`{PREFIX}schatzkammern` - Zeigt die Schatzkammer-Koordinaten",
+    f"`{PREFIX}schatzkammern-setzen 12|34; -5|8` - Ueberschreibt die Schatzkammer-Koordinaten",
     "`/melden` - Meldet einen Angriff strukturiert mit optionalem `seit`-Zeitpunkt",
     "",
     "Angriffsmeldungen in den beobachteten Kanaelen werden automatisch ausgewertet.",
@@ -334,6 +391,13 @@ def invalidate_travian_map_cache() -> None:
 
 def load_map_snapshot_from_disk() -> dict | None:
     path = Path(TRAVIAN_MAP_DATA_PATH)
+    if not path.exists():
+        return None
+    return load_map_payload(str(path))
+
+
+def load_yesterday_map_snapshot_from_disk() -> dict | None:
+    path = Path(TRAVIAN_MAP_DATA_YESTERDAY_PATH)
     if not path.exists():
         return None
     return load_map_payload(str(path))
@@ -658,6 +722,7 @@ def run_startup_maintenance() -> None:
             server_url=TRAVIAN_SERVER_URL,
             private_api_key=TRAVIAN_PRIVATE_API_KEY,
             output_path=TRAVIAN_MAP_DATA_PATH,
+            yesterday_path=TRAVIAN_MAP_DATA_YESTERDAY_PATH,
         )
     except Exception:
         logging.exception(
@@ -670,6 +735,7 @@ def run_startup_maintenance() -> None:
                 server_url=TRAVIAN_SERVER_URL,
                 private_api_key=TRAVIAN_PRIVATE_API_KEY,
                 output_path=TRAVIAN_MAP_DATA_PATH,
+                yesterday_path=TRAVIAN_MAP_DATA_YESTERDAY_PATH,
             )
         except Exception:
             logging.exception("Kartendaten konnten auch mit neuem Travian API-Schluessel nicht aktualisiert werden.")
@@ -684,9 +750,11 @@ def run_startup_maintenance() -> None:
     logging.info("Startup maintenance finished.")
 
 
-def run_daily_maintenance() -> None:
+def run_daily_maintenance() -> tuple[dict | None, dict | None, bool]:
     global _pending_history_summary
     logging.info("Daily maintenance started.")
+    previous_payload = load_map_snapshot_from_disk()
+    previous_signature = snapshot_signature(previous_payload)
     _pending_history_summary = prepare_history_reset_summary(
         "Automatische Zusammenfassung vor dem naechtlichen Zuruecksetzen:"
     )
@@ -696,14 +764,22 @@ def run_daily_maintenance() -> None:
             server_url=TRAVIAN_SERVER_URL,
             private_api_key=TRAVIAN_PRIVATE_API_KEY,
             output_path=TRAVIAN_MAP_DATA_PATH,
+            yesterday_path=TRAVIAN_MAP_DATA_YESTERDAY_PATH,
         )
     except Exception:
         logging.exception("Kartendaten konnten in der Nachtwartung nicht aktualisiert werden.")
+        logging.info("Daily maintenance finished.")
+        return previous_payload, None, False
     else:
         if refreshed:
             invalidate_travian_map_cache()
             logging.info("Travian map data refreshed during daily maintenance.")
+            new_payload = load_map_snapshot_from_disk()
+            new_signature = snapshot_signature(new_payload)
+            logging.info("Daily maintenance finished.")
+            return previous_payload, new_payload, previous_signature != new_signature
     logging.info("Daily maintenance finished.")
+    return previous_payload, None, False
 
 
 def is_watch_channel_id(channel_id: int | None) -> bool:
@@ -716,6 +792,14 @@ def is_command_channel_id(channel_id: int | None) -> bool:
 
 def is_bot_channel_id(channel_id: int | None) -> bool:
     return is_watch_channel_id(channel_id) or is_command_channel_id(channel_id)
+
+
+def is_settlement_announcement_channel_id(channel_id: int | None) -> bool:
+    return (
+        channel_id is not None
+        and SETTLEMENT_ANNOUNCEMENT_CHANNEL_ID
+        and channel_id == SETTLEMENT_ANNOUNCEMENT_CHANNEL_ID
+    )
 
 
 def is_message_in_watch_channel(message: discord.Message) -> bool:
@@ -785,8 +869,41 @@ async def send_history_summary_chunks(chunks: list[str], fallback_channel: disco
         await output_channel.send(chunk)
 
 
+async def run_startup_settlement_rule_check() -> None:
+    yesterday_path = Path(TRAVIAN_MAP_DATA_YESTERDAY_PATH)
+    current_path = Path(TRAVIAN_MAP_DATA_PATH)
+    if not yesterday_path.exists() or not current_path.exists():
+        return
+
+    try:
+        previous_payload = load_map_payload(str(yesterday_path))
+        new_payload = get_travian_map_payload()
+    except Exception:
+        logging.exception("Siedelregelpruefung aus Kartendateien konnte nicht vorbereitet werden.")
+        return
+
+    if snapshot_signature(previous_payload) == snapshot_signature(new_payload):
+        return
+
+    await run_settlement_rule_check(
+        bot,
+        previous_payload=previous_payload,
+        new_payload=new_payload,
+        member_store=kingdom_member_store,
+        treasury_store=treasury_store,
+        report_store=settlement_report_store,
+        config=settlement_discord_config,
+        yesterday_payload=previous_payload,
+    )
+
+
 async def process_attack_message(message: discord.Message) -> None:
-    if not is_message_in_watch_channel(message) or message.author.bot or message.content.startswith(PREFIX):
+    if (
+        not is_message_in_watch_channel(message)
+        or is_settlement_announcement_channel_id(message.channel.id)
+        or message.author.bot
+        or message.content.startswith(PREFIX)
+    ):
         return
 
     try:
@@ -882,11 +999,10 @@ def build_attack_body_from_source(
     if resolution is None:
         return None
 
-    attacker_player_link = build_player_link(TRAVIAN_SERVER_URL, resolution.attacker)
-    defender_player_link = build_player_link(TRAVIAN_SERVER_URL, resolution.defender)
-    attacker_village_link = build_village_link(TRAVIAN_SERVER_URL, resolution.attacker_village)
-    defender_village_link = build_village_link(TRAVIAN_SERVER_URL, resolution.defender_village)
-    defender_village_name = resolution.defender_village.name
+    attacker_ref = build_player_reference(TRAVIAN_SERVER_URL, resolution.attacker)
+    defender_ref = build_player_reference(TRAVIAN_SERVER_URL, resolution.defender)
+    attacker_village_ref = build_village_reference(TRAVIAN_SERVER_URL, resolution.attacker_village)
+    defender_village_ref = build_village_reference(TRAVIAN_SERVER_URL, resolution.defender_village)
 
     ram_guess = resolution.guesses.get("ram")
     kata_guess = resolution.guesses.get("katapult")
@@ -943,14 +1059,10 @@ def build_attack_body_from_source(
         translate(
             BOT_LOCALE,
             "from_to",
-            attacker=resolution.attacker.name,
-            attacker_link=attacker_player_link,
-            attacker_village=resolution.attacker_village.name,
-            attacker_village_link=attacker_village_link,
-            defender=resolution.defender.name,
-            defender_link=defender_player_link,
-            defender_village=defender_village_name,
-            defender_village_link=defender_village_link,
+            attacker_ref=attacker_ref,
+            attacker_village_ref=attacker_village_ref,
+            defender_ref=defender_ref,
+            defender_village_ref=defender_village_ref,
         ),
     ]
     if message_url:
@@ -968,10 +1080,26 @@ def build_attack_body_from_source(
     return "\n".join(body_lines), resolution
 
 
+def build_player_reference(server_url: str, player: object) -> str:
+    name = getattr(player, "name", "") or "Unbekannt"
+    if not getattr(player, "player_id", ""):
+        return name
+    return f"[{name}]({build_player_link(server_url, player)})"
+
+
+def build_village_reference(server_url: str, village: object) -> str:
+    name = getattr(village, "name", "") or f"{getattr(village, 'x', '?')}/{getattr(village, 'y', '?')}"
+    return f"[{name}]({build_village_link(server_url, village)})"
+
+
+def get_message_noted_time(message: discord.Message) -> object:
+    return (message.edited_at or message.created_at).astimezone()
+
+
 def build_attack_body(message: discord.Message, message_content: str) -> tuple[str, object] | None:
     return build_attack_body_from_source(
         message_content=message_content,
-        noted_time=message.created_at.astimezone(),
+        noted_time=get_message_noted_time(message),
         message_url=message.jump_url,
     )
 
@@ -1029,6 +1157,7 @@ def build_attack_embed_from_source(
 @bot.event
 async def on_ready() -> None:
     global _pending_history_summary
+    global _startup_settlement_check_done
     logging.info("Logged in as %s (ID: %s)", bot.user, bot.user.id if bot.user else "n/a")
     if not nightly_maintenance.is_running():
         nightly_maintenance.start()
@@ -1049,6 +1178,9 @@ async def on_ready() -> None:
     if _pending_history_summary:
         await send_history_summary_chunks(_pending_history_summary)
         _pending_history_summary = []
+    if not _startup_settlement_check_done:
+        await run_startup_settlement_rule_check()
+        _startup_settlement_check_done = True
 
 
 @bot.hybrid_command(name="hallo", aliases=["hello"], with_app_command=True)
@@ -1113,6 +1245,12 @@ async def channels(ctx: commands.Context) -> None:
         for channel_id in sorted(WATCH_CHANNEL_IDS_ONLY_COMMANDS)
     ]
     output_link = build_channel_link(guild_id, OUTPUT_CHANNEL_ID) if OUTPUT_CHANNEL_ID else "-"
+    settlement_link = (
+        build_channel_link(guild_id, SETTLEMENT_ANNOUNCEMENT_CHANNEL_ID)
+        if SETTLEMENT_ANNOUNCEMENT_CHANNEL_ID
+        else "-"
+    )
+    rule_output_link = build_channel_link(guild_id, RULE_OUTPUT_CHANNEL_ID) if RULE_OUTPUT_CHANNEL_ID else "-"
 
     lines = [
         "Aktuelle Kanal-Konfiguration:",
@@ -1120,6 +1258,8 @@ async def channels(ctx: commands.Context) -> None:
         f"Watch-Kanaele fuer Meldungen: {', '.join(watch_links) if watch_links else '-'}",
         f"Nur-Befehle-Kanaele: {', '.join(command_only_links) if command_only_links else '-'}",
         f"Ausgabe-Kanal: {output_link}",
+        f"Siedelkanal: {settlement_link}",
+        f"Regel-Ausgabe-Kanal: {rule_output_link}",
     ]
     await ctx.send("\n".join(lines))
 
@@ -1136,12 +1276,20 @@ async def slash_channels(interaction: discord.Interaction) -> None:
         for channel_id in sorted(WATCH_CHANNEL_IDS_ONLY_COMMANDS)
     ]
     output_link = build_channel_link(guild_id, OUTPUT_CHANNEL_ID) if OUTPUT_CHANNEL_ID else "-"
+    settlement_link = (
+        build_channel_link(guild_id, SETTLEMENT_ANNOUNCEMENT_CHANNEL_ID)
+        if SETTLEMENT_ANNOUNCEMENT_CHANNEL_ID
+        else "-"
+    )
+    rule_output_link = build_channel_link(guild_id, RULE_OUTPUT_CHANNEL_ID) if RULE_OUTPUT_CHANNEL_ID else "-"
     lines = [
         "Aktuelle Kanal-Konfiguration:",
         "Bot-Zugriff: `nur konfigurierte Bot-Kanaele`",
         f"Watch-Kanaele fuer Meldungen: {', '.join(watch_links) if watch_links else '-'}",
         f"Nur-Befehle-Kanaele: {', '.join(command_only_links) if command_only_links else '-'}",
         f"Ausgabe-Kanal: {output_link}",
+        f"Siedelkanal: {settlement_link}",
+        f"Regel-Ausgabe-Kanal: {rule_output_link}",
     ]
     await interaction.response.send_message("\n".join(lines))
 
@@ -1174,8 +1322,25 @@ async def summary(ctx: commands.Context) -> None:
 
 
 @bot.hybrid_command(
+    name="summarylaufend",
+    aliases=["summaryaktiv", "summarylive", "summaryrunning", "summary-laufend"],
+    with_app_command=True,
+)
+async def running_summary(ctx: commands.Context) -> None:
+    entries = filter_running_history_entries(history_store.list_entries())
+    if not entries:
+        await ctx.send("Es laufen aktuell keine gespeicherten Angriffe.")
+        return
+    for chunk in build_history_summary_chunks(
+        entries,
+        title="Zusammenfassung der aktuell laufenden Angriffe:",
+    ):
+        await ctx.send(chunk)
+
+
+@bot.hybrid_command(
     name="summarydorf",
-    aliases=["summaryziel", "summarydef", "summaryd"],
+    aliases=["summary-dorf", "summaryziel", "summarydef", "summaryd"],
     with_app_command=True,
 )
 async def summary_by_defender_village(ctx: commands.Context) -> None:
@@ -1184,6 +1349,28 @@ async def summary_by_defender_village(ctx: commands.Context) -> None:
         await ctx.send("Die Angriffshistorie ist aktuell leer.")
         return
     for chunk in build_defender_village_summary_chunks(entries):
+        await ctx.send(chunk)
+
+
+@bot.hybrid_command(
+    name="summarydorflaufend",
+    aliases=[
+        "summaryziellaufend",
+        "summarydeflaufend",
+        "summarydlaufend",
+        "summary-dorf-laufend",
+    ],
+    with_app_command=True,
+)
+async def running_summary_by_defender_village(ctx: commands.Context) -> None:
+    entries = filter_running_history_entries(history_store.list_entries())
+    if not entries:
+        await ctx.send("Es laufen aktuell keine gespeicherten Angriffe.")
+        return
+    for chunk in build_defender_village_summary_chunks(
+        entries,
+        title="Zusammenfassung der aktuell laufenden Angriffe nach Zieldorf:",
+    ):
         await ctx.send(chunk)
 
 
@@ -1240,6 +1427,7 @@ async def update_tk(ctx: commands.Context) -> None:
                 server_url=TRAVIAN_SERVER_URL,
                 private_api_key=TRAVIAN_PRIVATE_API_KEY,
                 output_path=TRAVIAN_MAP_DATA_PATH,
+                yesterday_path=TRAVIAN_MAP_DATA_YESTERDAY_PATH,
             )
         except Exception:
             logging.exception("Manuelles Travian-Update fehlgeschlagen.")
@@ -1264,6 +1452,18 @@ async def update_tk(ctx: commands.Context) -> None:
             "Die Travian-Kartendaten wurden aktualisiert.\n"
             + summarize_snapshot_change(previous_payload, new_payload)
         )
+        if previous_payload is not None:
+            await run_settlement_rule_check(
+                bot,
+                previous_payload=previous_payload,
+                new_payload=new_payload,
+                member_store=kingdom_member_store,
+                treasury_store=treasury_store,
+                report_store=settlement_report_store,
+                config=settlement_discord_config,
+                fallback_channel=ctx.channel,
+                yesterday_payload=load_yesterday_map_snapshot_from_disk(),
+            )
     finally:
         release_update_tk_run(scope_id)
 
@@ -1395,14 +1595,25 @@ async def nightly_maintenance() -> None:
 
     now = discord.utils.utcnow().astimezone()
     current_date = now.date().isoformat()
-    should_run = now.hour == 1 and now.minute < 5 and _last_maintenance_date != current_date
+    should_run = now.hour == 0 and 30 <= now.minute < 35 and _last_maintenance_date != current_date
     if not should_run:
         return
 
-    run_daily_maintenance()
+    previous_payload, new_payload, map_changed = run_daily_maintenance()
     if _pending_history_summary:
         await send_history_summary_chunks(_pending_history_summary)
         _pending_history_summary = []
+    if map_changed and previous_payload is not None and new_payload is not None:
+        await run_settlement_rule_check(
+            bot,
+            previous_payload=previous_payload,
+            new_payload=new_payload,
+            member_store=kingdom_member_store,
+            treasury_store=treasury_store,
+            report_store=settlement_report_store,
+            config=settlement_discord_config,
+            yesterday_payload=load_yesterday_map_snapshot_from_disk(),
+        )
     _last_maintenance_date = current_local_date()
     logging.info("Taegliche Wartung ausgefuehrt: Historie geleert und Kartendaten aktualisiert.")
 
@@ -1416,7 +1627,7 @@ def main() -> None:
     global _last_maintenance_date
     run_startup_maintenance()
     now = discord.utils.utcnow().astimezone()
-    if now.hour == 1:
+    if now.hour == 0 and now.minute >= 30:
         _last_maintenance_date = current_local_date()
     bot.run(TOKEN, log_handler=None)
 

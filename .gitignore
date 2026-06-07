@@ -11,3 +11,7 @@ logs/
 raspberry-logs/
 attack-history.json
 travian-map-data.json
+travian-map-data-yesterday.json
+kingdom-members.json
+treasury-coordinates.json
+settlement-rule-reports.json
